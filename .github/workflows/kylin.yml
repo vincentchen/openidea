@@ -189,13 +189,15 @@ jobs:
           test -x "$app/runtime/libexec/webkit2gtk-4.1/WebKitNetworkProcess"
           test -f "$app/runtime/libexec/webkit2gtk-4.1/injected-bundle/libwebkit2gtkinjectedbundle.so"
 
+          # Match on the name prefix only: the versions live in the Rust sources
+          # and move with upstream releases.
           echo "== embedded Java plugins =="
-          for jar in java-usages-1.12.0.jar kotlin-bridge-1.0.0.jar lombok-1.18.48-openidea.3.jar; do
+          for jar in java-usages- kotlin-bridge- jvm-inspect- lombok-1.18; do
             if ! grep -qa "$jar" "$app/openidea"; then
-              echo "::error::$jar is not embedded in the binary"
+              echo "::error::no $jar jar is embedded in the binary"
               exit 1
             fi
-            echo "  $jar"
+            echo "  $jar*"
           done
 
           echo "== runtime closure =="
@@ -284,24 +286,37 @@ jobs:
 
             - `amd64` (x86_64) and `arm64` (aarch64) .deb packages
             - AppImage for both architectures
-            - `.tar.gz` archives: unpack anywhere and run `./openidea`
+            - `.tar.gz` archives for both architectures: unpack and run `./openidea`
             - `SHA256SUMS` for integrity checks
 
             **Self-contained runtime.** The packages carry the glibc, GTK and
             WebKitGTK 4.1 runtime they were built against and start through the
             bundled loader. Kylin V10 SP1 (glibc 2.31, webkit2gtk 4.0 only)
-            needs no extra packages: install the .deb or run the AppImage on a
-            machine with a working X11 or Wayland desktop.
+            needs no extra packages: install the .deb, run the AppImage, or
+            unpack the .tar.gz on a machine with a working X11 or Wayland
+            desktop. There is no dependency on `libwebkit2gtk-4.1-0`.
 
-            **Java support included.** The java-usages, kotlin-bridge and
-            lombok jars are compiled into the binary; no separate download is
-            needed.
+            **Portable archive.** The `.tar.gz` needs no installation and no FUSE:
+
+            ```
+            tar -xzf OpenIDEA_${{ needs.version.outputs.version }}_kylin_amd64.tar.gz
+            cd OpenIDEA-${{ needs.version.outputs.version }}-kylin-amd64
+            ./openidea
+            ```
+
+            The directory can be moved or renamed, including paths with spaces.
+            `./install-desktop.sh` adds a menu entry for the current user,
+            pointing at that copy.
+
+            **Java support included.** The java-usages, kotlin-bridge,
+            jvm-inspect and lombok jars are compiled into the binary; no
+            separate download is needed.
 
             Notes:
 
-            - The WebKit sandbox is disabled by default because it cannot see
-              an AppImage mount. Set `OPENIDEA_WEBKIT_SANDBOX=1` to keep it in
-              a regular installation.
+            - The WebKit sandbox is disabled by default because it cannot see the
+              paths of a relocated bundle. Set `OPENIDEA_WEBKIT_SANDBOX=1` to
+              keep it enabled.
             - GPU drivers still come from the host. Without a GPU the app falls
               back to Mesa's software renderer, so `libgl1-mesa-dri` should be
               installed on machines without one.
