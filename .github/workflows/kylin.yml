@@ -189,16 +189,23 @@ jobs:
           test -x "$app/runtime/libexec/webkit2gtk-4.1/WebKitNetworkProcess"
           test -f "$app/runtime/libexec/webkit2gtk-4.1/injected-bundle/libwebkit2gtkinjectedbundle.so"
 
-          # Match on the name prefix only: the versions live in the Rust sources
-          # and move with upstream releases.
+          # The jars are pulled in with include_bytes!, so their exact bytes sit
+          # in the binary. Check the bytes rather than a filename: the names are
+          # built at runtime and versions move with upstream.
           echo "== embedded Java plugins =="
-          for jar in java-usages- kotlin-bridge- jvm-inspect- lombok-1.18; do
-            if ! grep -qa "$jar" "$app/openidea"; then
-              echo "::error::no $jar jar is embedded in the binary"
-              exit 1
-            fi
-            echo "  $jar*"
-          done
+          python3 - "$app/openidea" <<'PY'
+          import glob, sys
+
+          binary = open(sys.argv[1], "rb").read()
+          jars = sorted(glob.glob("java/*/*.jar"))
+          if not jars:
+              sys.exit("no jars found under java/")
+          missing = [jar for jar in jars if open(jar, "rb").read() not in binary]
+          if missing:
+              sys.exit("not embedded in the binary: " + ", ".join(missing))
+          for jar in jars:
+              print(f"  {jar}")
+          PY
 
           echo "== runtime closure =="
           loader=$(find "$app/runtime/lib" -maxdepth 1 -name 'ld-linux-*.so.*' | head -1)
