@@ -262,9 +262,7 @@ jobs:
 
       - name: Collect packages
         run: |
-          out=kylin-dist
-          (cd "$out" && sha256sum -- *.deb *.AppImage *.tar.gz > SHA256SUMS)
-          ls -lh "$out"
+          ls -lh kylin-dist
 
       - uses: actions/upload-artifact@v4
         with:
@@ -283,6 +281,11 @@ jobs:
         with:
           path: dist
           merge-multiple: true
+
+      # Both architectures land in one directory, so the checksums are written
+      # here: one file per matrix job would overwrite the other.
+      - name: Checksums
+        run: (cd dist && sha256sum -- *.deb *.AppImage *.tar.gz > SHA256SUMS && cat SHA256SUMS)
 
       - uses: softprops/action-gh-release@v2
         with:
