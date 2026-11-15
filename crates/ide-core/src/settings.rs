@@ -86,6 +86,18 @@ pub struct AgentSettings {
     pub fold_turns: bool,
     /// Streaming text is revealed at a steady pace rather than chunk by chunk.
     pub smooth_text: bool,
+    /// Conversations and the composer expand to the full width of the pane instead of staying in a centred column.
+    pub fit_window_width: bool,
+    /// While the agent works, playful words fill the pauses in what it reports.
+    pub playful_status: bool,
+    /// Seconds the agent reports nothing new before the playful words take over; 0 shows them
+    /// from the start.
+    pub playful_after_seconds: u32,
+    /// The user's playful words by activity (`working`, `thinking`, `reading`, …), replacing
+    /// the built-in ones of that activity; an empty list keeps its status factual.
+    #[serde(deserialize_with = "or_default")]
+    #[specta(type = BTreeMap<String, Vec<String>>)]
+    pub playful_words: BTreeMap<String, Vec<String>>,
     #[serde(deserialize_with = "or_default")]
     #[specta(type = ThinkingDisplay)]
     pub thinking: ThinkingDisplay,
@@ -127,6 +139,10 @@ impl Default for AgentSettings {
             show_cost: false,
             fold_turns: true,
             smooth_text: true,
+            fit_window_width: false,
+            playful_status: false,
+            playful_after_seconds: 0,
+            playful_words: BTreeMap::new(),
             thinking: ThinkingDisplay::Auto,
             tool_calls: ToolCallDisplay::Grouped,
             expand_tool_output: false,
@@ -1092,7 +1108,8 @@ impl Default for ExternalFormatterSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PythonSettings {
-    /// Project interpreter executable; empty = auto-detect (project venv, else `python3`).
+    /// Project interpreter executable; empty = auto-detect (project venv, else `python3`);
+    /// `target:<run-target-id>` = the Python of a Docker or Compose run target.
     pub interpreter: String,
     /// Activate the interpreter's virtualenv in new terminal sessions.
     pub activate_virtualenv: bool,
@@ -1118,6 +1135,17 @@ impl Default for PythonSettings {
             hide_other_project_interpreters: false,
             show_interpreter_paths: true,
         }
+    }
+}
+
+impl PythonSettings {
+    /// What `interpreter` starts with when the project interpreter is a run target's.
+    pub const TARGET_PREFIX: &str = "target:";
+
+    /// The run target whose Python is the project interpreter (`target:<id>`), if one is.
+    pub fn run_target(&self) -> Option<&str> {
+        let id = self.interpreter.trim().strip_prefix(Self::TARGET_PREFIX)?.trim();
+        (!id.is_empty()).then_some(id)
     }
 }
 
@@ -1159,6 +1187,9 @@ pub struct NodeSettings {
     pub run_target: String,
     /// `npm` | `pnpm` | `yarn`; empty = detect from the lock file / `packageManager`.
     pub package_manager: String,
+    /// Runtime for running JavaScript / TypeScript files: `node` | `bun` | `deno`; empty = from the
+    /// project (`deno.json` → Deno, `bun.lock` → Bun, else Node.js).
+    pub runtime: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
@@ -1355,11 +1386,15 @@ pub struct TypeScriptSettings {
     /// `bundled` (the server's own TypeScript), `workspace` (`node_modules/typescript`),
     /// or a path to a TypeScript `lib` directory.
     pub version: String,
+    /// tsserver heap limit in MB. `0` = automatic: 8192 when vtsls hosts the Vue
+    /// plugin (hybrid mode; a Vue project's program alone needs ~3 GiB, and the
+    /// vtsls default 3072 dies in a GC death spiral), else unset (vtsls default).
+    pub tsserver_max_memory: u32,
 }
 
 impl Default for TypeScriptSettings {
     fn default() -> Self {
-        Self { version: "bundled".into() }
+        Self { version: "bundled".into(), tsserver_max_memory: 0 }
     }
 }
 
@@ -1536,6 +1571,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn python_interpreter_may_name_a_run_target() {
+        let python = |interpreter: &str| PythonSettings { interpreter: interpreter.into(), ..Default::default() };
+        assert_eq!(python("target:web").run_target(), Some("web"));
+        assert_eq!(python(" target: web ").run_target(), Some("web"));
+        for local in ["", "target:", "/usr/bin/python3", ".venv/bin/python", "targets/python"] {
+            assert_eq!(python(local).run_target(), None, "{local}");
+        }
+    }
+
+    #[test]
     fn removed_one_themes_read_as_islands_themes() {
         let settings: Settings = serde_json::from_str(
             r#"{"appearance":{"theme":"one-dark","preferredLightTheme":"one-light","preferredDarkTheme":"one-dark"}}"#,
@@ -1686,11 +1731,15 @@ mod tests {
         let old: Settings = serde_json::from_str(r#"{"agents":{"showCost":true}}"#).unwrap();
         assert!(old.agents.show_cost);
         assert!(old.agents.show_context_usage && old.agents.show_work_time && old.agents.show_usage_limits);
+        assert!(!old.agents.fit_window_width);
         assert!(!Settings::default().agents.show_cost);
+        assert!(!Settings::default().agents.fit_window_width);
         let mut settings = Settings::default();
         settings.agents.show_usage_limits = false;
+        settings.agents.fit_window_width = true;
         let json = serde_json::to_value(&settings).unwrap();
         assert_eq!(json["agents"]["showUsageLimits"], false);
+        assert_eq!(json["agents"]["fitWindowWidth"], true);
         let restored: Settings = serde_json::from_value(json).unwrap();
         assert_eq!(restored.agents, settings.agents);
     }

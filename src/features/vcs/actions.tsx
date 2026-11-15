@@ -25,6 +25,7 @@ import {
   showUnstashDialog,
 } from "./changeOps";
 import { setAmend, useCommit } from "./commitStore";
+import { currentPlan } from "./commitSelection";
 import { gotoConflict, resolveAtCaret, showConflictsDialog } from "./conflictsUi";
 import { focusedDiffNavigator } from "./diffNavigator";
 import { showDiffWindow } from "./DiffWindow";
@@ -59,6 +60,7 @@ import {
   showWorktrees,
 } from "./gitMenuDialogs";
 import { currentRepo, refreshNow, repoName, repoOf, useVcs } from "./store";
+import { showSyncCommitsForCurrent } from "./SyncCommitsPopup";
 import { tx } from "@/platform/i18n";
 
 import { addToIgnore } from "./ignore";
@@ -141,6 +143,21 @@ function selectedPaths(arg: unknown): string[] {
   if (changed.length) return changed;
   const project = projectViewSelection();
   return project.length ? project : contextPaths(arg);
+}
+
+/**
+ * The repository a repository-wide dialog (Pull, Merge, Rebase) starts on: the one holding the
+ * action's file, else the Project view's selection while it has focus, else the active editor's
+ * file, else the selected repository.
+ */
+export function operationRepo(arg: unknown): string | null {
+  const roots = useVcs.getState().roots;
+  if (arg && typeof arg === "object" && "repo" in arg) return (arg as { repo: string | null }).repo;
+  const inContext = (paths: readonly string[] | undefined) =>
+    paths?.map((p) => repoOf(p, roots)).find((r) => r != null) ?? null;
+  const fromProject = getContext().activeToolWindow === "project" ? projectViewSelection() : undefined;
+  const active = maybeEditorService()?.activePath();
+  return inContext(argPaths(arg)) ?? inContext(fromProject) ?? inContext(active ? [active] : []) ?? currentRepo();
 }
 
 function showGitWindow() {
@@ -287,7 +304,7 @@ export function registerVcsActions(): () => void {
       category: "Git",
       icon: "git-pull",
       when: VCS,
-      run: showPullDialog,
+      run: ({ arg }) => showPullDialog(operationRepo(arg)),
     },
     {
       id: "vcs.merge",
@@ -295,7 +312,7 @@ export function registerVcsActions(): () => void {
       category: "Git",
       when: VCS,
       keywords: ["merge branch"],
-      run: showMergeDialog,
+      run: ({ arg }) => showMergeDialog(operationRepo(arg)),
     },
     {
       id: "vcs.rebase",
@@ -303,7 +320,7 @@ export function registerVcsActions(): () => void {
       category: "Git",
       when: VCS,
       keywords: ["rebase branch"],
-      run: showRebaseDialog,
+      run: ({ arg }) => showRebaseDialog(operationRepo(arg)),
     },
     {
       id: "vcs.manageRemotes",
@@ -357,9 +374,20 @@ export function registerVcsActions(): () => void {
         // IDEA: in the editor, with the caret on changed lines, ⌥⌘Z is Rollback Lines.
         const ed = activeEditor();
         if (!explicit?.length && ed?.view.hasFocus && rollbackSelectedLines(ed.view)) return;
+        // The Commit window's subject is its tree selection; when the selection holds
+        // nothing rollbackable (unversioned files, stale paths), the checked changes are
+        // instead — as IDEA's toolbar Rollback acts on the checked changes there.
+        const focused = commitWindowFocused();
         const sel = useCommit.getState().selection;
-        const paths = explicit?.length ? explicit : commitWindowFocused() && sel.length ? sel : undefined;
-        if (paths) {
+        const fromSel = focused && sel.length ? rollbackCandidates(sel) : null;
+        const paths = explicit?.length
+          ? explicit
+          : fromSel?.length
+            ? sel
+            : focused
+              ? currentPlan().included.map((f) => f.path)
+              : undefined;
+        if (paths?.length) {
           const candidates = rollbackCandidates(paths);
           const submodule = paths.find((p) => isNestedRepoEntry(p));
           if (!candidates.length && submodule)
@@ -403,6 +431,8 @@ export function registerVcsActions(): () => void {
           useChangelists.getState().state,
           state.roots,
           useCommit.getState().groupByStaging,
+          undefined,
+          useCommit.getState().groupByRepo,
         );
         // The modal interface has one front diff window (#1863): a file with its group
         // as the F7 chain, or several selected files as the chain.
@@ -612,6 +642,15 @@ export function registerVcsActions(): () => void {
         void revealCommit(id, repo);
       },
     },
+    {
+      id: "vcs.syncCommits",
+      title: "Show Incoming and Outgoing Commits",
+      category: "Git",
+      icon: "history",
+      when: VCS,
+      keywords: ["incoming", "outgoing", "ahead", "behind", "unpushed", "unpulled"],
+      run: ({ arg }) => showSyncCommitsForCurrent(arg === "incoming" || arg === "outgoing" ? arg : undefined),
+    },
     ...(["gitignore", "localExclude"] as const).map((destination): Action => ({
       id: destination === "gitignore" ? "vcs.ignoreShared" : "vcs.ignoreLocal",
       title: destination === "gitignore" ? "Add to .gitignore" : "Add to .git/info/exclude",
@@ -638,6 +677,25 @@ export function registerVcsActions(): () => void {
       icon: "stash",
       when: VCS,
       run: () => void stashChanges(),
+    },
+    {
+      id: "vcs.stashSelected",
+      title: "Stash Selected Files…",
+      category: "Git",
+      icon: "stash",
+      when: VCS,
+      run: ({ arg }) => {
+        const paths = changedPaths(arg);
+        if (!paths.length) {
+          notifications().notify({
+            group: "vcs",
+            level: "info",
+            title: tx("Select the files to stash in the Commit view first"),
+          });
+          return;
+        }
+        void stashChanges(paths);
+      },
     },
     {
       id: "vcs.unstash",

@@ -97,14 +97,17 @@ export interface DebuggerSettingsValid {
   showOnBreakpoint: boolean;
   focusAppOnBreakpoint: boolean;
   hideOnTermination: boolean;
+  variablesOnBreakpoint: boolean;
   breakpointsAnyFile: boolean;
   runToCursorInlay: boolean;
   inlineValues: boolean;
   sortValues: boolean;
+  liveWatches: boolean;
   valueTooltip: boolean;
   valueTooltipOnSelection: boolean;
   valueTooltipDelay: number;
   skipLibraryCode: boolean;
+  debugServerPage: boolean;
   python: { attachSubprocess: boolean; gevent: boolean };
 }
 
@@ -113,6 +116,8 @@ export interface RunSettingsValid {
   confirmRerun: boolean;
   confirmTerminate: boolean;
   showOnStart: boolean;
+  /** New Run/Debug tabs start pinned, so a later run doesn't take their place (IDEA's advanced setting). */
+  pinTabs: boolean;
   terminationTimeoutMs: number;
 }
 
@@ -288,17 +293,27 @@ export const DEFAULT_WORKFLOW: WorkflowSettings = {
     showOnBreakpoint: true,
     focusAppOnBreakpoint: false,
     hideOnTermination: false,
+    variablesOnBreakpoint: true,
     breakpointsAnyFile: false,
     runToCursorInlay: true,
     inlineValues: true,
     sortValues: false,
+    liveWatches: false,
     valueTooltip: true,
     valueTooltipOnSelection: true,
     valueTooltipDelay: 700,
     skipLibraryCode: true,
+    debugServerPage: false,
     python: { attachSubprocess: true, gevent: false },
   },
-  run: { defaultTarget: "", confirmRerun: true, confirmTerminate: true, showOnStart: true, terminationTimeoutMs: 3000 },
+  run: {
+    defaultTarget: "",
+    confirmRerun: true,
+    confirmTerminate: true,
+    showOnStart: true,
+    pinTabs: false,
+    terminationTimeoutMs: 3000,
+  },
   terminal: {
     startDirectory: "",
     env: {},
@@ -445,14 +460,17 @@ export function validateDebugger(raw: unknown): DebuggerSettingsValid {
     showOnBreakpoint: bool(v.showOnBreakpoint, d.showOnBreakpoint),
     focusAppOnBreakpoint: bool(v.focusAppOnBreakpoint, d.focusAppOnBreakpoint),
     hideOnTermination: bool(v.hideOnTermination, d.hideOnTermination),
+    variablesOnBreakpoint: bool(v.variablesOnBreakpoint, d.variablesOnBreakpoint),
     breakpointsAnyFile: bool(v.breakpointsAnyFile, d.breakpointsAnyFile),
     runToCursorInlay: bool(v.runToCursorInlay, d.runToCursorInlay),
     inlineValues: bool(v.inlineValues, d.inlineValues),
     sortValues: bool(v.sortValues, d.sortValues),
+    liveWatches: bool(v.liveWatches, d.liveWatches),
     valueTooltip: bool(v.valueTooltip, d.valueTooltip),
     valueTooltipOnSelection: bool(v.valueTooltipOnSelection, d.valueTooltipOnSelection),
     valueTooltipDelay: num(v.valueTooltipDelay, d.valueTooltipDelay, WORKFLOW_LIMITS.tooltipDelay, true),
     skipLibraryCode: bool(v.skipLibraryCode, d.skipLibraryCode),
+    debugServerPage: bool(v.debugServerPage, d.debugServerPage),
     python: {
       attachSubprocess: bool(py.attachSubprocess, d.python.attachSubprocess),
       gevent: bool(py.gevent, d.python.gevent),
@@ -468,6 +486,7 @@ export function validateRun(raw: unknown): RunSettingsValid {
     confirmRerun: bool(v.confirmRerun, d.confirmRerun),
     confirmTerminate: bool(v.confirmTerminate, d.confirmTerminate),
     showOnStart: bool(v.showOnStart, d.showOnStart),
+    pinTabs: bool(v.pinTabs, d.pinTabs),
     terminationTimeoutMs: num(
       v.terminationTimeoutMs,
       d.terminationTimeoutMs,

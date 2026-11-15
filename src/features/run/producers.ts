@@ -31,7 +31,7 @@ import { djangoLabel, djangoTestsOf, hasDjangoTests } from "./djangoTypes";
 import { firstTopLevelType, scanJvmTargets, simpleClassName } from "./jvmTargets";
 import { isWindows } from "./jvmTypes";
 import { inheritedRunTargets } from "./inheritedMain";
-import { detectRunTargets, targetConfig, targetLanguage, zigTargets, type RunTarget } from "./targets";
+import { detectRunTargets, goFuzzConfig, targetConfig, targetLanguage, zigTargets, type RunTarget } from "./targets";
 import { tx } from "@/platform/i18n";
 
 export interface LocatedTool {
@@ -50,9 +50,11 @@ export interface ToolEnv {
   python?: string | null;
   /** The PHP interpreter chosen in settings (else the `php` on `PATH`). */
   php?: string | null;
-  /** The project root has `deno.json(c)` / `bun.lock(b)`. */
+  /** Run JavaScript / TypeScript with Deno / Bun: the project has `deno.json(c)` / `bun.lock(b)`, or `preferred`. */
   deno?: boolean;
   bun?: boolean;
+  /** Deno / Bun was chosen as the preferred runtime, so it also runs files outside the project. */
+  preferred?: boolean;
 }
 
 /** Names only: every tool unknown. */
@@ -523,16 +525,27 @@ function pythonCommand(input: ContextInput, env: ToolEnv, s: FileSite): { comman
   return t ? { command: t.command, prefix: [] } : null;
 }
 
+/** The preferred runtime is not installed: say so rather than run the file with another one. */
+function preferredMissing(file: string, runtime: string, command: string, site: string): Missing {
+  return {
+    title: tx`Cannot run '${file}'`,
+    body: tx`${runtime} was not found (looked for \`${command}\`). Install it from ${site}, or choose another preferred runtime in Settings › Languages & Frameworks › JavaScript Runtime.`,
+  };
+}
+
 function jsRuntime(lang: "js" | "ts", env: ToolEnv, s: FileSite): Produced {
   const name = s.file;
   const ok = (config: RunConfig): Produced => ({ name, scope: "file", config });
-  if (s.inProject && env.deno) {
+  if ((s.inProject || env.preferred) && env.deno) {
     const deno = pick(env, ["deno"]);
     if (deno) return ok(fileConfig(s, "deno", deno.command, ["run", s.arg], "js-debug"));
+    if (env.preferred)
+      return { name, scope: "file", missing: preferredMissing(name, "Deno", "deno", "https://deno.com") };
   }
-  if (s.inProject && env.bun) {
+  if ((s.inProject || env.preferred) && env.bun) {
     const bun = pick(env, ["bun"]);
     if (bun) return ok(fileConfig(s, "bun", bun.command, ["run", s.arg], "bun-dap"));
+    if (env.preferred) return { name, scope: "file", missing: preferredMissing(name, "Bun", "bun", "https://bun.sh") };
   }
   const node = env.tool("node");
   const nodeCmd = node === undefined ? "node" : (node?.path ?? null);
@@ -647,7 +660,15 @@ function zigFile(input: ContextInput, env: ToolEnv, s: FileSite, test?: { name: 
     isTest: false,
     debugAdapter: null,
   };
-  const binary: RunConfig = { ...config, kind: "native", command: out, args: [], isTest: false };
+  const binary: RunConfig = {
+    ...config,
+    kind: "native",
+    command: out,
+    args: [],
+    isTest: false,
+    // Marks the debugged program as Zig: CodeLLDB's source mode stays off (see nativeLaunch).
+    params: { language: "zig" },
+  };
   return { name, scope, config, debug: { build: buildConfig, config: binary } };
 }
 
@@ -1119,7 +1140,7 @@ function elementProduction(input: ContextInput, env: ToolEnv, target: RunTarget)
   }
   if (/\.zig$/.test(input.path)) {
     // `--test-filter` matches a substring of the test's full name.
-    return zigFile(input, env, s, { name: target.name, filter: target.name.replace(/\\(.)/g, "$1") });
+    return zigFile(input, env, s, { name: target.name, filter: target.name });
   }
   const rust = /\.rs$/.test(input.path);
   if (rust && !(s.inProject && cargoOwner(rel, input.configs).length)) {
@@ -1149,6 +1170,17 @@ export function produceContext(input: ContextInput, env: ToolEnv): Produced | nu
     }
   }
   return produceFile(input, env);
+}
+
+/** GoLand's "Run '<name>' with Fuzzing": the `Fuzz` function at the caret, run with `go test -fuzz`. */
+export function produceFuzz(input: ContextInput, env: ToolEnv): Produced | null {
+  input = scopedInput(input);
+  if (input.content === undefined || input.line === undefined || !/_test\.go$/.test(input.path)) return null;
+  const targets = fileTargets(input, input.content.slice(0, 400_000));
+  const inner = innermostTarget(input.content, targets, input.line);
+  const produced = inner && elementProduction(input, env, inner);
+  const config = inner && produced?.config && goFuzzConfig(produced.config, inner);
+  return produced && config ? { ...produced, config } : null;
 }
 
 /**
