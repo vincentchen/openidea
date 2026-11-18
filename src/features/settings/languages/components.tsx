@@ -6,7 +6,8 @@ import { useProject } from "@/platform/project";
 import { call, commands, isTauri } from "@/platform/ipc";
 import { tx } from "@/platform/i18n";
 import { useSetting } from "../components/context";
-import { choosePath, detectSdks, useSdks, type Sdk, type SdkKind } from "./api";
+import { detectSdks, useSdks, type Sdk, type SdkKind } from "./api";
+import { choosePath } from "@/platform/choosePath";
 import { DownloadJdkDialog } from "./DownloadJdkDialog";
 import styles from "./Sdk.module.css";
 
@@ -34,7 +35,8 @@ export function useDetected(kind: SdkKind): { list: Sdk[]; loading: boolean; err
   useEffect(() => {
     void detectSdks(kind);
   }, [kind]);
-  return { list: list ?? [], loading: loading || !list, error, refresh: () => void detectSdks(kind, true) };
+  // A failed detection is over too: it shows no choices instead of loading forever.
+  return { list: list ?? [], loading: loading || (!list && !error), error, refresh: () => void detectSdks(kind, true) };
 }
 
 export interface SdkFieldProps {

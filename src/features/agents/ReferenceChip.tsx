@@ -7,7 +7,7 @@ import { Fragment, useEffect, useRef, useState, type ReactNode } from "react";
 import clsx from "clsx";
 import { computePosition, flip, offset, shift } from "@floating-ui/react-dom";
 import { highlightInto, languageForPath } from "@/editor/lsp/markdown";
-import { iconNode } from "@/editor/lsp/iconMarkup";
+import { iconNode } from "@/ui/iconNode";
 import { executeAction } from "@/platform/actions";
 import { tx, useTx } from "@/platform/i18n";
 import { call, commands } from "@/platform/ipc";
@@ -28,17 +28,22 @@ import styles from "./ReferenceChip.module.css";
 
 export { styles as chipStyles };
 
+const MAX_EXISTING = 4000;
 /** Whether a path names an existing file or folder, per path (the same files come up again and again). */
 const existing = new Map<string, Promise<boolean>>();
 export function fileExists(path: string): Promise<boolean> {
   let known = existing.get(path);
-  if (!known) {
-    known = call(commands.fsProbe(path)).then(
-      () => true,
-      () => false,
-    );
+  if (known) {
+    existing.delete(path);
     existing.set(path, known);
+    return known;
   }
+  known = call(commands.fsProbe(path)).then(
+    () => true,
+    () => false,
+  );
+  if (existing.size >= MAX_EXISTING) existing.delete(existing.keys().next().value!);
+  existing.set(path, known);
   return known;
 }
 

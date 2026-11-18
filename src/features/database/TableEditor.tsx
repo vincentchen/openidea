@@ -39,13 +39,41 @@ const PAGE_SIZES = ["100", "500", "1000", "5000"];
 
 export { tableTitle } from "./tableInput";
 
+/** WHERE, ORDER BY and page of a table tab, kept when a tab that is no longer kept alive mounts again. */
+interface TableViewState {
+  offset: number;
+  limit: number;
+  sort: DbSortKey[];
+  filterText: string;
+  filter: string;
+}
+
+const MAX_VIEW_STATES = 100;
+const viewStates = new Map<string, TableViewState>();
+
+function rememberViewState(key: string, state: TableViewState) {
+  viewStates.delete(key);
+  viewStates.set(key, state);
+  if (viewStates.size > MAX_VIEW_STATES) viewStates.delete(viewStates.keys().next().value!);
+}
+
+/** Test hook: forget the remembered table view states. */
+export function _resetTableViewStates() {
+  viewStates.clear();
+}
+
 export function TableEditor({ input }: { input: EditorInput }) {
   const ref = input.data as TableRef;
-  const [offset, setOffset] = useState(0);
-  const [limit, setLimit] = useState(500);
-  const [sort, setSort] = useState<DbSortKey[]>([]);
-  const [filterText, setFilterText] = useState("");
-  const [filter, setFilter] = useState("");
+  const [initial] = useState(() => viewStates.get(input.key));
+  const [offset, setOffset] = useState(initial?.offset ?? 0);
+  const [limit, setLimit] = useState(initial?.limit ?? 500);
+  const [sort, setSort] = useState<DbSortKey[]>(initial?.sort ?? []);
+  const [filterText, setFilterText] = useState(initial?.filterText ?? "");
+  const [filter, setFilter] = useState(initial?.filter ?? "");
+  useEffect(
+    () => rememberViewState(input.key, { offset, limit, sort, filterText, filter }),
+    [input.key, offset, limit, sort, filterText, filter],
+  );
   const [nonce, setNonce] = useState(0);
   const [edits, setEdits] = useState<PendingEdits>(emptyEdits);
   const [panel, setPanel] = useState<DataPanel | null>(null);
@@ -215,18 +243,61 @@ export function TableEditor({ input }: { input: EditorInput }) {
     const r = viewRef.current?.getBoundingClientRect();
     if (page && r) setColumnsAt({ x: r.left + r.width / 2, y: r.top + 48 });
   };
+  const addRow = () => setEdits((e) => ({ ...e, inserts: [...e.inserts, new Map()] }));
+  const restoreRows = (rows: number[]) =>
+    setEdits((e) => ({ ...e, deletes: new Set([...e.deletes].filter((d) => !rows.includes(d))) }));
+  const showExport = (at: { x: number; y: number }) =>
+    page &&
+    showContextMenu(
+      at,
+      exportMenu(
+        {
+          columns: gridColumns,
+          rows: page.result.rows,
+          table: ref.table,
+          driver: sourceById(ref.id)?.driver ?? "sqlite",
+        },
+        `${ref.schema}.${ref.table}`,
+        extractor,
+      ),
+    );
+  const canPrevious = offset > 0 && !loading;
+  const canNext = !!page?.result.hasMore && !loading;
+  handle.commands = {
+    reload: { enabled: () => !loading, run: reload },
+    firstPage: { enabled: () => canPrevious, run: () => setOffset(0) },
+    previousPage: { enabled: () => canPrevious, run: () => setOffset(Math.max(0, offset - limit)) },
+    nextPage: { enabled: () => canNext, run: () => setOffset(offset + limit) },
+    addRow: { enabled: () => editable, run: addRow },
+    exportData: {
+      enabled: () => !!page,
+      run: () => {
+        const r = viewRef.current?.querySelector("[data-db-export]")?.getBoundingClientRect();
+        if (r) showExport({ x: r.left, y: r.bottom });
+      },
+    },
+    deleteRows: { enabled: (rows) => editable && rows.length > 0, run: deleteRows },
+    restoreRows: { enabled: (rows) => editable && rows.some((r) => edits.deletes.has(r)), run: restoreRows },
+  };
   useEffect(() => registerTableEditor(viewRef.current!, handle), [handle]);
   useEffect(() => tableEditorChanged(handle), [handle, dirty, editable]);
   const orderInvalid = orderDraft !== null && !parseOrderBy(orderDraft, names);
   return (
     <div className={styles.view} ref={viewRef} data-db-table-editor="">
       <div className={styles.toolbar}>
-        <IconButton icon="refresh" title="Reload Page" onClick={reload} disabled={loading} />
+        <IconButton
+          icon="refresh"
+          title="Reload Page"
+          shortcut={shortcutLabel("db.reloadPage")}
+          onClick={reload}
+          disabled={loading}
+        />
         <div className={styles.pager}>
           <IconButton
             icon="chevron-left"
             title="Previous Page"
-            disabled={offset === 0 || loading}
+            shortcut={shortcutLabel("db.previousPage")}
+            disabled={!canPrevious}
             onClick={() => setOffset(Math.max(0, offset - limit))}
           />
           <span>
@@ -236,7 +307,8 @@ export function TableEditor({ input }: { input: EditorInput }) {
           <IconButton
             icon="chevron-right"
             title="Next Page"
-            disabled={!page?.result.hasMore || loading}
+            shortcut={shortcutLabel("db.nextPage")}
+            disabled={!canNext}
             onClick={() => setOffset(offset + limit)}
           />
           <Select
@@ -251,11 +323,7 @@ export function TableEditor({ input }: { input: EditorInput }) {
         </div>
         {editable && (
           <>
-            <IconButton
-              icon="plus"
-              title="Add Row"
-              onClick={() => setEdits((e) => ({ ...e, inserts: [...e.inserts, new Map()] }))}
-            />
+            <IconButton icon="plus" title="Add Row" shortcut={shortcutLabel("db.addRow")} onClick={addRow} />
             <Button
               size="small"
               variant="primary"
@@ -281,23 +349,10 @@ export function TableEditor({ input }: { input: EditorInput }) {
         <IconButton
           icon="export"
           title="Export Data"
+          shortcut={shortcutLabel("db.exportData")}
+          data-db-export=""
           disabled={!page}
-          onClick={(e) =>
-            page &&
-            showContextMenu(
-              e,
-              exportMenu(
-                {
-                  columns: gridColumns,
-                  rows: page.result.rows,
-                  table: ref.table,
-                  driver: sourceById(ref.id)?.driver ?? "sqlite",
-                },
-                `${ref.schema}.${ref.table}`,
-                extractor,
-              ),
-            )
-          }
+          onClick={(e) => showExport({ x: e.clientX, y: e.clientY })}
         />
         <IconButton
           icon="import"
@@ -396,12 +451,8 @@ export function TableEditor({ input }: { input: EditorInput }) {
             rowMenu={(rows) =>
               editable
                 ? [
-                    { label: "Delete Rows", icon: "trash", run: () => deleteRows(rows) },
-                    {
-                      label: "Restore Rows",
-                      run: () =>
-                        setEdits((e) => ({ ...e, deletes: new Set([...e.deletes].filter((d) => !rows.includes(d))) })),
-                    },
+                    { kind: "action", action: "db.deleteRows", icon: "trash", arg: { rows, editor: handle } },
+                    { kind: "action", action: "db.restoreRows", arg: { rows, editor: handle } },
                   ]
                 : []
             }

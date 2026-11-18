@@ -10,11 +10,13 @@ import { maybeEditorService, notifications, projectViewSelection } from "@/workb
 import { promptText } from "./dialogs";
 import { focusedDiffNavigator } from "./diffNavigator";
 import { compareFilesData, displayPath } from "./compareData";
+import { showDirectoryComparison } from "./directoryCompareKind";
 export { compareFilesData, displayPath } from "./compareData";
 import { openDiff, openVcsDiff, type DiffData } from "./diffInput";
 import { baseName } from "./model";
 import { tx } from "@/platform/i18n";
 import { readClipboardPlainText } from "@/platform/clipboard";
+import { workflowSettings } from "@/platform/workflowSettings";
 
 function argPath(arg: unknown): string | undefined {
   if (typeof arg === "string") return arg;
@@ -127,11 +129,6 @@ async function pickComparison(
 
 const contextPath = (arg: unknown) => argPath(arg) ?? maybeEditorService()?.activePath() ?? undefined;
 
-async function showDirectories(left: string, right: string) {
-  const { showDirectoryComparison } = await import("./DirectoryCompare");
-  showDirectoryComparison(left, right);
-}
-
 async function isDirectory(path: string): Promise<boolean> {
   try {
     return (await call(commands.fsEntryKind(path))) === "dir";
@@ -218,6 +215,18 @@ export function registerCompareActions(): () => void {
       run: () => void focusedDiffNavigator()?.swapSides(),
     },
     {
+      id: "diff.showInExternalTool",
+      title: "Show Diff in External Tool",
+      category: "Diff",
+      icon: "external-tools",
+      when: "diffEditorFocus",
+      enabled: () => {
+        const { enabled, path } = workflowSettings().externalDiff;
+        return enabled && !!path;
+      },
+      run: () => void focusedDiffNavigator()?.showInExternalTool(),
+    },
+    {
       id: "diff.openBlankDiff",
       title: "Open Blank Diff Window",
       description: "Opens two editors side by side to compare their content",
@@ -287,7 +296,7 @@ export function registerCompareActions(): () => void {
           const other = await pickDirectory(path);
           if (!other || other === path) return;
           if (!(await isDirectory(other))) return info("Select a directory to compare");
-          await showDirectories(path, other);
+          showDirectoryComparison(path, other);
           return;
         }
         const other = await pickComparison(path);
@@ -316,7 +325,7 @@ export function registerCompareActions(): () => void {
         const paths = arg === undefined ? projectViewSelection() : argPaths(arg);
         if (paths.length !== 2 || !(await isDirectory(paths[0]!)) || !(await isDirectory(paths[1]!)))
           return info("Select two directories to compare");
-        await showDirectories(paths[0]!, paths[1]!);
+        showDirectoryComparison(paths[0]!, paths[1]!);
       },
     },
     {

@@ -391,18 +391,24 @@ pub(crate) fn discard(r: &Repo, paths: &[PathBuf]) -> IdeResult<()> {
     let rel = r.rel_paths(paths)?;
     // `git restore --worktree` refuses unmerged paths: roll those back to HEAD first.
     discard_unmerged(r, &rel)?;
-    let (mut tracked, mut untracked) = (Vec::new(), Vec::new());
+    let (mut tracked, mut untracked, mut submodules) = (Vec::new(), Vec::new(), Vec::new());
     {
         let repo = r.gix()?;
         let index = repo.index_or_empty().map_err(gx)?;
         for p in rel {
-            let exact = index.entry_index_by_path(BStr::new(p.as_bytes())).is_ok();
+            let exact = index.entry_index_by_path(BStr::new(p.as_bytes())).ok().map(|i| &index.entries()[i]);
             let dir_prefix = if p == "." { String::new() } else { format!("{}/", p.trim_end_matches('/')) };
-            let has_tracked_children = index.prefixed_entries(BStr::new(dir_prefix.as_bytes())).is_some();
-            if exact {
-                tracked.push(p);
+            let children = index.prefixed_entries(BStr::new(dir_prefix.as_bytes()));
+            if let Some(entry) = exact {
+                if entry.mode.is_submodule() {
+                    submodules.push(p);
+                } else {
+                    tracked.push(p);
+                }
             } else if r.abs_path(&p).is_dir() {
-                if has_tracked_children {
+                if let Some(children) = children {
+                    submodules
+                        .extend(children.iter().filter(|e| e.mode.is_submodule()).map(|e| e.path(&index).to_string()));
                     tracked.push(p.clone());
                 }
                 untracked.push(p);
@@ -412,6 +418,11 @@ pub(crate) fn discard(r: &Repo, paths: &[PathBuf]) -> IdeResult<()> {
         }
     }
     run_paths(r, &["restore", "--worktree"], &tracked)?;
+    // A plain restore leaves a submodule alone. This one checks out the commit the index
+    // records there and restores its tracked files, keeping its untracked ones.
+    if crate::execution_allowed() {
+        run_paths(r, &["restore", "--recurse-submodules", "--worktree"], &submodules)?;
+    }
     if !untracked.is_empty() {
         // `git clean` keeps ignored files and refuses paths outside the worktree.
         run_paths(r, &["clean", "-f", "-d", "-q"], &untracked)?;
@@ -760,9 +771,14 @@ fn overwritten_files(stderr: &str) -> Option<Vec<String>> {
     listed_files(stderr, "local changes to the following files would be overwritten")
 }
 
-/// Untracked files git refuses to overwrite, from its error message.
-fn overwritten_untracked(stderr: &str) -> Option<Vec<String>> {
-    listed_files(stderr, "untracked working tree files would be")
+/// Untracked files git refuses to lose, from its error message: they would be *removed*
+/// by the checkout (tracked here, absent from the target) or *overwritten* by it (present
+/// in the target). Returns the files and whether they would be removed.
+fn refused_untracked(stderr: &str) -> Option<(Vec<String>, bool)> {
+    if let Some(files) = listed_files(stderr, "untracked working tree files would be removed") {
+        return Some((files, true));
+    }
+    Some((listed_files(stderr, "untracked working tree files would be")?, false))
 }
 
 /// The branch git refused to check out or update because another worktree has it, from
@@ -829,8 +845,8 @@ pub(crate) fn checkout_with(
     if let Some((branch, path)) = branch_of_other_worktree(&stderr) {
         return Ok(CheckoutOutcome::CheckedOutInWorktree { branch, path: path.into() });
     }
-    if let Some(files) = overwritten_untracked(&stderr) {
-        return Ok(CheckoutOutcome::UntrackedFiles { files });
+    if let Some((files, removed)) = refused_untracked(&stderr) {
+        return Ok(CheckoutOutcome::UntrackedFiles { files, removed });
     }
     let Some(files) = overwritten_files(&stderr) else {
         return Err(cli::failure(&argv, &out.stderr, &out.stdout, out.code));

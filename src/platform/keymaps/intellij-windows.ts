@@ -5,6 +5,7 @@
  */
 export const intellijWindows: Record<string, string[]> = {
   "editor.addOrRemoveCaret": ["Alt+Shift+Button1"],
+  "editor.createRectangularSelectionOnMouseDrag": ["Alt+Button1", "Button2"],
   // Navigate
   "navigate.searchEverywhere": ["Shift Shift"],
   "navigate.gotoClass": ["Ctrl+N"],
@@ -57,6 +58,7 @@ export const intellijWindows: Record<string, string[]> = {
   "navigate.nextEditLocation": [],
   "navigate.gotoTest": ["Ctrl+Shift+T"],
   "navigate.superMethod": ["Ctrl+U"],
+  "navigate.relatedSymbol": ["Ctrl+Alt+Home"],
   "navigate.nextMethod": ["Alt+Down"],
   "navigate.previousMethod": ["Alt+Up"],
   "navigate.nextOccurrence": ["Ctrl+Alt+Down"],
@@ -172,6 +174,7 @@ export const intellijWindows: Record<string, string[]> = {
   "refactor.inline": ["Ctrl+Alt+N"],
   "refactor.move": ["F6"],
   "refactor.safeDelete": ["Alt+Delete"],
+  "refactor.extractInterface": [],
   "refactor.pullMembersUp": [],
   "refactor.pushMembersDown": [],
 
@@ -212,6 +215,7 @@ export const intellijWindows: Record<string, string[]> = {
   "project.paste": ["Ctrl+V", "Shift+Insert"],
   "project.copyAbsolutePath": ["Ctrl+Shift+C"],
   "project.open": ["F4"],
+  "project.openInRightSplit": ["Shift+Enter"],
   "project.findUsages": ["Alt+F7"],
   "project.reformatCode": ["Ctrl+Alt+L"],
   "project.optimizeImports": ["Ctrl+Alt+O"],
@@ -372,6 +376,17 @@ export const intellijWindows: Record<string, string[]> = {
   "db.goToColumn": ["Ctrl+F12"],
   "db.submitChanges": ["Ctrl+Enter"],
   "db.revertChanges": ["Ctrl+Alt+Z"],
+  // Data editor (table editor / result grid), IDEA's Console.TableResult.* defaults.
+  "db.reloadPage": ["Ctrl+F5"],
+  "db.firstPage": [],
+  "db.previousPage": ["Ctrl+Alt+Up"],
+  "db.nextPage": ["Ctrl+Alt+Down"],
+  "db.lastPage": [],
+  "db.addRow": ["Alt+Insert"],
+  "db.deleteRows": ["Ctrl+Y", "Alt+Delete"],
+  "db.restoreRows": [],
+  "db.exportData": [],
+  "db.editCell": [],
   "db.showToolWindow": [],
   "agents.newTask": ["Ctrl+Alt+Shift+I"],
   "agents.focusInput": ["Ctrl+L"],

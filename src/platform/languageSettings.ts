@@ -168,6 +168,7 @@ export interface LanguagesValid {
     showInterpreterPaths: boolean;
   };
   ruby: { interpreter: string };
+  zig: { zig: string };
   node: {
     runTarget: string;
     interpreter: string;
@@ -230,6 +231,8 @@ export interface LanguagesValid {
       activeProfiles: string;
       /** Delegate IDE build/run actions to Maven (`javac`) instead of jdtls (ECJ). */
       delegateBuild: boolean;
+      /** Download dependencies' `-sources.jar` when jdtls imports the project. */
+      downloadSources: boolean;
     };
   };
   /** Preview font size in px; `null` follows the editor font size. */
@@ -284,6 +287,7 @@ export const DEFAULT_LANGUAGES: LanguagesValid = {
     showInterpreterPaths: true,
   },
   ruby: { interpreter: "" },
+  zig: { zig: "" },
   node: { runTarget: "", interpreter: "", packageManager: "", runtime: "" },
   php: { runTarget: "", interpreter: "", languageLevel: "", includePaths: [], stubs: [], phpstanConfig: "" },
   rust: { toolchain: "", stdlib: "", checkOnSave: true, checkCommand: "check", rustfmtArgs: "" },
@@ -312,6 +316,7 @@ export const DEFAULT_LANGUAGES: LanguagesValid = {
       threads: "",
       activeProfiles: "",
       delegateBuild: false,
+      downloadSources: false,
     },
   },
   markdown: { previewFontSize: null },
@@ -393,6 +398,7 @@ export function validateLanguages(raw: unknown): LanguagesValid {
   const l = obj(raw);
   const py = obj(l.python);
   const ruby = obj(l.ruby);
+  const zig = obj(l.zig);
   const node = obj(l.node);
   const php = obj(l.php);
   const rust = obj(l.rust);
@@ -419,6 +425,7 @@ export function validateLanguages(raw: unknown): LanguagesValid {
       showInterpreterPaths: bool(py.showInterpreterPaths, d.python.showInterpreterPaths),
     },
     ruby: { interpreter: text(ruby.interpreter, d.ruby.interpreter) },
+    zig: { zig: text(zig.zig, d.zig.zig) },
     node: {
       runTarget: text(node.runTarget, ""),
       interpreter: text(node.interpreter, d.node.interpreter),
@@ -488,6 +495,7 @@ export function validateLanguages(raw: unknown): LanguagesValid {
         threads: text(maven.threads, d.java.maven.threads),
         activeProfiles: text(maven.activeProfiles, d.java.maven.activeProfiles),
         delegateBuild: bool(maven.delegateBuild, d.java.maven.delegateBuild),
+        downloadSources: bool(maven.downloadSources, d.java.maven.downloadSources),
       },
     },
     markdown: { previewFontSize: previewSize(markdown.previewFontSize) },

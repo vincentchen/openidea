@@ -15,7 +15,7 @@ import {
   type MouseEvent,
   type PointerEvent,
 } from "react";
-import { tx } from "@/platform/i18n";
+import { tx, txTemplate } from "@/platform/i18n";
 import clsx from "clsx";
 import { executeAction } from "@/platform/actions";
 import { basename, dirname } from "@/platform/project";
@@ -26,7 +26,6 @@ import {
   EmptyState,
   Icon,
   IconButton,
-  List,
   Menu,
   Select,
   SplitGroup,
@@ -38,12 +37,19 @@ import {
   registerDropTarget,
   showContextMenu,
   startPointerDrag,
+  tooltipAttrs,
   type MenuItem,
   type TabItem,
   type TreeHandle,
   T,
 } from "@/ui";
-import { editorService, maybeEditorService, type EditorInput, useMenuSlotItems } from "@/workbench/contributions";
+import {
+  editorService,
+  maybeEditorService,
+  menuGroupItems,
+  type EditorInput,
+  useMenuSlotItems,
+} from "@/workbench/contributions";
 import { evaluateWhen, useContextKeys } from "@/platform/context";
 import { useToolWindowLayout } from "@/workbench/toolwindows/store";
 import {
@@ -61,6 +67,7 @@ import {
 import { applyStash, commitChanges, deleteFiles, dropStash, showUnstashDialog, stashChanges } from "./changeOps";
 import { CommitOptionsPopup } from "./CommitOptions";
 import { DEFAULT_LIST_NAME, useChangelists, withListDefaults } from "./changelists";
+import { inclusionChecks, isCommitAll, useStagingArea } from "./staging";
 import { addToChangelist, commitFiles } from "./changelistsUi";
 import { acceptSide } from "./conflictsUi";
 import { copyChangesAsPatch } from "./patches";
@@ -73,6 +80,7 @@ import {
   setGroupByDir,
   setGroupByRepo,
   setGroupByStaging,
+  setShowUnversionedSeparately,
   useCommit,
   type CommitTab,
 } from "./commitStore";
@@ -94,7 +102,8 @@ import {
 import { DiffEditor } from "./DiffEditor";
 import { KIND_COLOR, KIND_LABEL, fileCount, formatTime, stashLabel, stripSlash } from "./model";
 import { call, commands } from "@/platform/ipc";
-import type { FileStatus } from "@/bindings";
+import type { Commit, FileStatus, Stash } from "@/bindings";
+import { showChangesDiff, toLogChanges, type LogChange } from "./logChanges";
 import { OperationBanner } from "./operations";
 import { runOp } from "./ops";
 import { ShelfPanel, loadShelves, useShelf } from "./shelf";
@@ -290,9 +299,11 @@ export function listMenu(id: string, active: boolean, files: readonly FileStatus
 
 /** Paths Delete… applies to: only when every selected file is unversioned (versioned ones are rolled back). */
 /** The selected files that still exist in the working tree (Delete… removes them from disk). */
+/** Whether the change leaves the file in the working tree. */
+const onDisk = (f: FileStatus) => f.unstaged !== "deleted" && !(f.staged === "deleted" && !f.unstaged);
+
 export function deletableFiles(nodes: ChangeNode[]): string[] {
   const files = filesOf(nodes);
-  const onDisk = (f: FileStatus) => f.unstaged !== "deleted" && !(f.staged === "deleted" && !f.unstaged);
   return files.length && files.every(onDisk) ? files.map((f) => f.path) : [];
 }
 
@@ -397,13 +408,14 @@ export function nodeMenu(
     {
       label: "Stage",
       icon: "plus",
-      disabled: !files.some((f) => f.unstaged),
+      // Under Staged Changes, a partially staged file only offers Unstage.
+      disabled: !files.some((f) => f.unstaged) || nodes.every((n) => n.group === "staged"),
       run: () => void runOp(tx`Stage ${paths.length} files`, () => call(commands.vcsStage(paths))),
     },
     {
       label: "Unstage",
       icon: "minus",
-      disabled: !files.some((f) => f.staged),
+      disabled: !files.some((f) => f.staged) || nodes.every((n) => n.group === "unstaged" || n.group === "unversioned"),
       run: () => void runOp(tx`Unstage ${paths.length} files`, () => call(commands.vcsUnstage(paths))),
     },
     { kind: "separator" },
@@ -424,10 +436,49 @@ export function nodeMenu(
     { kind: "action", action: "vcs.localHistory", arg: first?.path },
     { kind: "action", action: "vcs.annotate", arg: first?.path },
     { kind: "separator" },
+    // Other features' groups (Deployment) for the files that exist.
+    ...menuGroupItems("changes", {
+      paths: files.filter(onDisk).map((f) => stripSlash(f.path)),
+    }),
     { label: "Copy Path", icon: "copy", run: () => copyChangePaths(nodes, "absolute") },
     { label: "Copy File Name", icon: "copy", run: () => copyChangePaths(nodes, "name") },
   );
   return items;
+}
+
+/**
+ * The staging operation of a node of the staging area's tree: Unstage under Staged, Stage
+ * under Unstaged and Unversioned Files, applied to every file below the node.
+ */
+export function stageOperation(n: ChangeNode): { label: string; icon: "plus" | "minus"; paths: string[] } | null {
+  const paths = n.files.map((f) => stripSlash(f.path));
+  if (!paths.length) return null;
+  if (n.group === "staged") return { label: "Unstage", icon: "minus", paths };
+  if (n.group === "unstaged" || n.group === "unversioned") return { label: "Stage", icon: "plus", paths };
+  return null;
+}
+
+function StageButton({ node }: { node: ChangeNode }) {
+  const op = stageOperation(node);
+  if (!op) return null;
+  const { label, icon, paths } = op;
+  const count = paths.length;
+  return (
+    <IconButton
+      icon={icon}
+      title={label}
+      size="small"
+      className={styles.stageButton}
+      onMouseDown={(e) => e.stopPropagation()}
+      onDoubleClick={(e) => e.stopPropagation()}
+      onClick={(e) => {
+        e.stopPropagation();
+        void runOp(icon === "plus" ? tx`Stage ${count} files` : tx`Unstage ${count} files`, () =>
+          call(icon === "plus" ? commands.vcsStage(paths) : commands.vcsUnstage(paths)),
+        ).then(() => refreshNow());
+      }}
+    />
+  );
 }
 
 function CheckMark({
@@ -466,7 +517,11 @@ function useCommitChecks() {
   const root = useVcs((s) => s.root) ?? "";
   const userChecks = useCommit((s) => s.checks);
   const lists = useChangelists((s) => s.state);
-  return useMemo(() => withListDefaults(status, root, lists, userChecks), [status, root, lists, userChecks]);
+  const staging = useStagingArea();
+  return useMemo(
+    () => inclusionChecks(status, root, lists, userChecks, staging),
+    [status, root, lists, userChecks, staging],
+  );
 }
 
 /** Number of changes the commit would include. */
@@ -567,14 +622,18 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
   const status = useVcs((s) => s.status);
   const root = useVcs((s) => s.root) ?? "";
   const groupByDir = useCommit((s) => s.groupByDir);
-  const groupByStaging = useCommit((s) => s.groupByStaging);
+  // With the staging area the Commit tool window shows the index: Staged / Unstaged, no lists or checkboxes.
+  const staging = useStagingArea() && mode === "commit";
+  const groupByStaging = useCommit((s) => s.groupByStaging) || staging;
   const groupByRepo = useCommit((s) => s.groupByRepo);
+  const showUnversionedSeparately = useCommit((s) => s.showUnversionedSeparately);
   const diffPreview = useCommit((s) => s.diffPreview);
   const commitDiffPreview = useCommit((s) => s.commitDiffPreview);
   const doubleClickOpensDiff = useWorkflowSettings((s) => s.vcs.commit.doubleClickOpensDiff);
-  const lists = useChangelists((s) => s.state);
+  const changelists = useChangelists((s) => s.state);
+  const lists = staging ? undefined : changelists;
   const checks = useCommitChecks();
-  const checkboxes = mode !== "local";
+  const checkboxes = mode !== "local" && !staging;
   const [dropTarget, setDropTarget] = useState<string | null>(null);
   // IDEA starts with Unversioned Files collapsed.
   const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(["group:unversioned"]));
@@ -586,8 +645,19 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
   const heads = useVcs((s) => s.heads);
   const projectRoots = useEffectiveRoots();
   const roots = useMemo(
-    () => buildChangeTree(status, root, groupByDir, lists, repos, groupByStaging, heads, groupByRepo),
-    [status, root, groupByDir, lists, repos, groupByStaging, heads, groupByRepo],
+    () =>
+      buildChangeTree(
+        status,
+        root,
+        groupByDir,
+        lists,
+        repos,
+        groupByStaging,
+        heads,
+        groupByRepo,
+        showUnversionedSeparately,
+      ),
+    [status, root, groupByDir, lists, repos, groupByStaging, heads, groupByRepo, showUnversionedSeparately],
   );
   const [byKey, parents] = useMemo(() => {
     const m = new Map<string, ChangeNode>();
@@ -709,7 +779,15 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
               ...(repos.length > 1
                 ? [{ label: "Repository", checked: groupByRepo, run: () => setGroupByRepo(!groupByRepo) }]
                 : []),
-              { label: "Staging State", checked: groupByStaging, run: () => setGroupByStaging(!groupByStaging) },
+              ...(staging
+                ? []
+                : [{ label: "Staging State", checked: groupByStaging, run: () => setGroupByStaging(!groupByStaging) }]),
+              { kind: "separator" },
+              {
+                label: "Show Unversioned Files Separately",
+                checked: showUnversionedSeparately,
+                run: () => setShowUnversionedSeparately(!showUnversionedSeparately),
+              },
               ...(mode === "local"
                 ? [
                     { kind: "separator" } as const,
@@ -838,7 +916,7 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
                   n.type === "group" && n.changelist && !n.active && styles.inactiveList,
                 )}
                 style={n.type === "file" && n.kind ? { color: KIND_COLOR[n.kind] } : undefined}
-                title={n.type === "file" && n.kind ? tx(KIND_LABEL[n.kind]) : undefined}
+                {...(n.type === "file" && n.kind && tooltipAttrs(KIND_LABEL[n.kind]))}
               >
                 {nodeText(n)}
               </span>
@@ -898,13 +976,14 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
                 )}
                 {label}
                 {n.type === "group" && <span className={styles.detail}>{fileCount(n.files.length)}</span>}
-                {n.type === "file" && n.files[0] && isPartiallyStaged(n.files[0]) && (
+                {!staging && n.type === "file" && n.files[0] && isPartiallyStaged(n.files[0]) && (
                   <span className={styles.partial} title={tx("Partially staged: only staged hunks are committed")}>
                     <T>partial</T>
                   </span>
                 )}
                 {n.detail && n.detailIcon && <Icon name={n.detailIcon} size={14} className={styles.detailIcon} />}
                 {n.detail && <span className={styles.detail}>{n.detail}</span>}
+                {staging && <StageButton node={n} />}
               </span>
             );
           }}
@@ -912,6 +991,14 @@ export function ChangesTree({ mode }: { mode: "commit" | "local" | "dialog" }) {
       </div>
     </div>
   );
+}
+
+const MISSING_BLANK_LINE = "Missing blank line between subject and body";
+
+/** The quick fix for {@link MISSING_BLANK_LINE}: an empty line after the subject. */
+export function addBlankLineAfterSubject(message: string): string {
+  const end = message.indexOf("\n");
+  return end < 0 ? message : `${message.slice(0, end)}\n${message.slice(end)}`;
 }
 
 /** Commit message inspections (Settings › Version Control › Commit). */
@@ -929,8 +1016,7 @@ export function messageProblems(
   const out: string[] = [];
   if (c.limitSubject && (lines[0]?.length ?? 0) > c.subjectLimit)
     out.push(`Subject line is longer than ${c.subjectLimit} characters`);
-  if (c.blankLineAfterSubject && lines.length > 1 && lines[1]!.trim() !== "")
-    out.push("Missing blank line between subject and body");
+  if (c.blankLineAfterSubject && lines.length > 1 && lines[1]!.trim() !== "") out.push(MISSING_BLANK_LINE);
   if (c.limitBody) {
     const long = lines.slice(1).findIndex((l) => l.length > c.bodyLimit);
     if (long >= 0) out.push(`Body line ${long + 2} is longer than ${c.bodyLimit} characters`);
@@ -1113,7 +1199,29 @@ export function CommitMessageField({
       )}
       {problems.length > 0 && (
         <div className={styles.inspections} role="status">
-          {problems.join(" · ")}
+          {problems.map((p, i) => (
+            <span key={p}>
+              {i > 0 && " · "}
+              {txTemplate(p)}
+              {p === MISSING_BLANK_LINE && (
+                <button
+                  type="button"
+                  className={styles.inspectionFix}
+                  onClick={() => {
+                    const el = ref.current;
+                    const caret = el ? el.selectionStart + (el.selectionStart > first.length ? 1 : 0) : 0;
+                    useCommit.setState({ message: addBlankLineAfterSubject(message) });
+                    requestAnimationFrame(() => {
+                      el?.focus();
+                      el?.setSelectionRange(caret, caret);
+                    });
+                  }}
+                >
+                  <T>Add blank line</T>
+                </button>
+              )}
+            </span>
+          ))}
         </div>
       )}
       {checkProblems.length > 0 && (
@@ -1157,8 +1265,8 @@ function CommitMessageActions() {
 }
 
 /** Label of the Commit button. */
-export function commitLabel(amend: boolean, problems: boolean): string {
-  return problems ? "Commit Anyway" : amend ? "Amend Commit" : "Commit";
+export function commitLabel(amend: boolean, problems: boolean, all = false): string {
+  return problems ? "Commit Anyway" : amend ? "Amend Commit" : all ? "Commit All" : "Commit";
 }
 
 /** Label of the Commit and Push button. */
@@ -1175,13 +1283,15 @@ function CommitPanel({ included }: { included: number }) {
   const { canCommit } = runner;
   // After Fixup… / Squash Into…, the second button commits and autosquashes the target.
   const fixup = useCommit((s) => pendingFixup(s.message, s.fixupTarget));
+  const staging = useStagingArea();
+  const commitAll = useVcs((s) => staging && isCommitAll(s.status));
 
   return (
     <div className={styles.commit}>
       <CommitMessageField included={included} runner={runner} />
       <div className={styles.commitActions}>
         <Button variant="primary" disabled={!canCommit} onClick={() => void runner.run(false)} title="⌘↩">
-          <T>{commitLabel(amend, checkProblems.length > 0)}</T>
+          <T>{commitLabel(amend, checkProblems.length > 0, commitAll)}</T>
         </Button>
         {fixup ? (
           <Button
@@ -1224,18 +1334,33 @@ function CommitPanel({ included }: { included: number }) {
 
 // ---------------------------------------------------------------------------
 
+type StashEntry = Stash & { repo: string | null };
+type StashNode = { key: string; stash: StashEntry; change?: LogChange };
+
+const stashKey = (s: StashEntry) => `${s.repo}:${s.index}:${s.id}`;
+const STASH_PREVIEW_DELAY = 120;
+
+/** A stash's changes against the commit it was made on, as Git Log changes (diffs, line counts). */
+async function stashFileChanges(stash: StashEntry): Promise<LogChange[]> {
+  const files = await call(commands.vcsCommitFiles(stash.repo, stash.id));
+  const commit = { id: stash.id, shortId: stash.id.slice(0, 8), parents: stash.base ? [stash.base] : [] };
+  return toLogChanges(files, commit as unknown as Commit, stash.repo, true);
+}
+
 export function StashesPanel() {
   const repo = useVcs((s) => s.repo);
   const repos = useVcs((s) => s.roots);
   const version = useVcs((s) => s.version);
   const [tick, setTick] = useState(0);
-  const [active, setActive] = useState(0);
+  const [selectedKey, setSelectedKey] = useState<string | null>(null);
   const request = useMemo(() => ({ repos, repo, version, tick }), [repos, repo, version, tick]);
   const [result, setResult] = useState<{
     request: typeof request;
-    stashes: (import("@/bindings").Stash & { repo: string | null })[];
+    stashes: StashEntry[];
     error: string | null;
   } | null>(null);
+  const [files, setFiles] = useState<ReadonlyMap<string, LogChange[]>>(new Map());
+  const previewTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
   const loaded = result?.request === request;
   const stashes = loaded ? result.stashes : [];
   const error = loaded ? result.error : null;
@@ -1256,7 +1381,29 @@ export function StashesPanel() {
       live = false;
     };
   }, [request]);
-  const current = stashes[active];
+  useEffect(() => () => clearTimeout(previewTimer.current), []);
+  const roots = useMemo<StashNode[]>(() => stashes.map((stash) => ({ key: stashKey(stash), stash })), [stashes]);
+  const childrenOf = (node: StashNode): StashNode[] | undefined =>
+    node.change
+      ? undefined
+      : files.get(node.key)?.map((change) => ({ key: `${node.key}\u0000${change.path}`, stash: node.stash, change }));
+  const loadFiles = async (node: StashNode) => {
+    if (files.has(node.key)) return;
+    const changes = await stashFileChanges(node.stash).catch(() => []);
+    setFiles((prev) => new Map(prev).set(node.key, changes));
+  };
+  const nodeOf = (key: string | null): StashNode | undefined => {
+    if (!key) return undefined;
+    const root = roots.find((r) => key === r.key || key.startsWith(`${r.key}\u0000`));
+    if (!root || key === root.key) return root;
+    return childrenOf(root)?.find((n) => n.key === key);
+  };
+  const selectedNode = nodeOf(selectedKey);
+  const current = selectedNode?.stash ?? stashes[0];
+  const showDiff = (node: StashNode, preview: boolean) => {
+    const chain = files.get(stashKey(node.stash)) ?? [];
+    if (node.change) void showChangesDiff([node.change], preview, chain).catch(() => undefined);
+  };
   return (
     <div className={styles.changes}>
       <div className={styles.toolbar} role="toolbar" aria-label={tx("Stashes")}>
@@ -1268,7 +1415,15 @@ export function StashesPanel() {
             options={repos.map((root) => ({ value: root, label: repoName(root) }))}
           />
         )}
-        <IconButton icon="refresh" title="Refresh" size="small" onClick={() => setTick((n) => n + 1)} />
+        <IconButton
+          icon="refresh"
+          title="Refresh"
+          size="small"
+          onClick={() => {
+            setFiles(new Map());
+            setTick((n) => n + 1);
+          }}
+        />
         <IconButton icon="plus" title="Stash Changes…" size="small" onClick={() => void stashChanges()} />
         <span className={styles.sep} />
         <IconButton
@@ -1293,44 +1448,77 @@ export function StashesPanel() {
           onClick={() => current && void dropStash(current.index, current.message, current.repo)}
         />
       </div>
-      <List
-        items={stashes}
-        getKey={(s) => `${s.repo}:${s.index}`}
-        activeIndex={Math.min(active, Math.max(0, stashes.length - 1))}
-        onActiveChange={setActive}
-        rowHeight={22}
-        aria-label="Stashes"
-        className={styles.stashList}
-        empty={<span className={styles.empty}>{error ?? (loaded ? tx("No stashes") : tx("Loading…"))}</span>}
-        onActivate={(s, _i, e) => {
-          if (e.type === "click" && (e as MouseEvent).detail < 2) return;
-          void applyStash(s.index, false, s.repo);
-        }}
-        onContextMenu={(s, i, e) => {
-          e.preventDefault();
-          setActive(i);
-          showContextMenu(e, [
-            { label: "Apply Stash", icon: "check", run: () => void applyStash(s.index, false, s.repo) },
-            { label: "Pop Stash", icon: "undo", run: () => void applyStash(s.index, true, s.repo) },
-            { label: "Unstash…", run: () => showUnstashDialog(s.index, s.repo) },
-            { kind: "separator" },
-            { label: "Drop Stash", icon: "trash", run: () => void dropStash(s.index, s.message, s.repo) },
-          ]);
-        }}
-        renderItem={(s) => {
-          const { branch, text } = stashLabel(s.message);
-          return (
-            <span className={styles.stashRow} title={`stash@{${s.index}}: ${s.message}`}>
-              <span className={styles.stashMessage}>
-                {repos.length > 1 && s.repo ? `${repoName(s.repo)} · ` : ""}
-                {text}
+      <div className={styles.treeWrap}>
+        <Tree<StashNode>
+          roots={roots}
+          getKey={(n) => n.key}
+          getLabel={(n) => (n.change ? basename(n.change.path) : n.stash.message)}
+          getChildren={childrenOf}
+          isExpandable={(n) => !n.change}
+          loadChildren={loadFiles}
+          selected={useMemo(() => new Set(selectedKey ? [selectedKey] : []), [selectedKey])}
+          multiSelect={false}
+          rowHeight={22}
+          aria-label="Stashes"
+          className={styles.stashList}
+          empty={<span className={styles.empty}>{error ?? (loaded ? tx("No stashes") : tx("Loading…"))}</span>}
+          onSelectionChange={(sel) => {
+            const key = [...sel][0] ?? null;
+            setSelectedKey(key);
+            clearTimeout(previewTimer.current);
+            const node = nodeOf(key);
+            // With Show Diff Preview on, the selection walks a preview tab through the stash's files.
+            if (node?.change && useCommit.getState().diffPreview && !vcsDiffInFront())
+              previewTimer.current = setTimeout(() => showDiff(node, true), STASH_PREVIEW_DELAY);
+          }}
+          onActivate={(n) => showDiff(n, false)}
+          onContextMenu={(n, _sel, e) => {
+            if (!n) return;
+            e.preventDefault();
+            setSelectedKey(n.key);
+            const s = n.stash;
+            showContextMenu(e, [
+              ...(n.change
+                ? [
+                    { label: "Show Diff", icon: "diff", run: () => showDiff(n, false) } as MenuItem,
+                    { kind: "separator" } as MenuItem,
+                  ]
+                : []),
+              { label: "Apply Stash", icon: "check", run: () => void applyStash(s.index, false, s.repo) },
+              { label: "Pop Stash", icon: "undo", run: () => void applyStash(s.index, true, s.repo) },
+              { label: "Unstash…", run: () => showUnstashDialog(s.index, s.repo) },
+              { kind: "separator" },
+              { label: "Drop Stash", icon: "trash", run: () => void dropStash(s.index, s.message, s.repo) },
+            ]);
+          }}
+          renderNode={(n) => {
+            if (n.change) {
+              const kind = n.change.kind === "untracked" ? "added" : n.change.kind;
+              return (
+                <>
+                  <Icon name={fileIconName(basename(n.change.path), n.change.path)} size={16} className={styles.icon} />
+                  <span className={styles.label} style={{ color: KIND_COLOR[kind] }}>
+                    {basename(n.change.path)}
+                  </span>
+                  <span className={styles.detail}>{dirname(n.change.path)}</span>
+                </>
+              );
+            }
+            const s = n.stash;
+            const { branch, text } = stashLabel(s.message);
+            return (
+              <span className={styles.stashRow} title={`stash@{${s.index}}: ${s.message}`}>
+                <span className={styles.stashMessage}>
+                  {repos.length > 1 && s.repo ? `${repoName(s.repo)} · ` : ""}
+                  {text}
+                </span>
+                {branch && <span className={clsx(styles.detail, styles.stashBranch)}>{branch}</span>}
+                <span className={clsx(styles.detail, styles.stashTime)}>{formatTime(s.timeMs)}</span>
               </span>
-              {branch && <span className={clsx(styles.detail, styles.stashBranch)}>{branch}</span>}
-              <span className={clsx(styles.detail, styles.stashTime)}>{formatTime(s.timeMs)}</span>
-            </span>
-          );
-        }}
-      />
+            );
+          }}
+        />
+      </div>
     </div>
   );
 }

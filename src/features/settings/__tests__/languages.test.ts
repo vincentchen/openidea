@@ -60,6 +60,7 @@ describe("languages settings", () => {
       threads: "2C",
       activeProfiles: "",
       delegateBuild: false,
+      downloadSources: false,
     });
     expect(validateSettings({}).languages).toEqual(DEFAULT_LANGUAGES);
     expect(validateLanguages({ java: { maven: { threads: 4 } } }).java.maven.threads).toBe("");
@@ -71,6 +72,7 @@ describe("languages settings", () => {
     expect(validateLanguages({ java: { maven: { runnerJre: 21 } } }).java.maven.runnerJre).toBe("");
     expect(validateLanguages({ java: { maven: { delegateBuild: true } } }).java.maven.delegateBuild).toBe(true);
     expect(validateLanguages({ java: { maven: { delegateBuild: "yes" } } }).java.maven.delegateBuild).toBe(false);
+    expect(validateLanguages({ java: { maven: { downloadSources: true } } }).java.maven.downloadSources).toBe(true);
     const settings = validateSettings({ languages: { java: { maven: { runnerJre: " ./jdks/21 " } } } });
     expect(validateSettings(settings).languages.java.maven.runnerJre).toBe("./jdks/21");
   });
@@ -102,6 +104,14 @@ describe("languages settings", () => {
     const settings = validateSettings({ languages: { ruby: { interpreter: " /opt/ruby/bin/ruby " } } });
     expect(settings.languages.ruby.interpreter).toBe("/opt/ruby/bin/ruby");
     expect(validateSettings(settings).languages.ruby.interpreter).toBe("/opt/ruby/bin/ruby");
+  });
+
+  it("keeps the Zig toolchain through settings normalization and defaults to Auto", () => {
+    expect(validateSettings({}).languages.zig.zig).toBe("");
+    expect(validateLanguages({ zig: { zig: 42 } }).zig.zig).toBe("");
+    const settings = validateSettings({ languages: { zig: { zig: " /opt/zig " } } });
+    expect(settings.languages.zig.zig).toBe("/opt/zig");
+    expect(validateSettings(settings).languages.zig.zig).toBe("/opt/zig");
   });
 
   it("defaults the PHP language level to Auto and keeps only known levels", () => {
@@ -342,6 +352,7 @@ describe("language pages", () => {
       "Ruby",
       "Rust",
       "TypeScript",
+      "Zig",
     ]);
   });
 

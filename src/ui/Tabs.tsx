@@ -50,7 +50,11 @@ export interface TabItem {
   color?: string;
   /** CSS colour the tab background is tinted with (IDEA's data source / file colours). */
   tint?: string;
+  /** How strongly `tint` shows, e.g. `var(--file-tint-strength)`; defaults to `--tint-strength`. */
+  tintStrength?: string;
   italic?: boolean;
+  /** Wavy error underline on the label: the file has errors (IDEA's problem files). */
+  error?: boolean;
   /** Greyed out, e.g. a run tab whose process has ended. */
   dimmed?: boolean;
   tooltip?: string;
@@ -401,7 +405,13 @@ export function Tabs({
                 marker === items.length && index === items.length - 1 && styles.dropAfter,
                 item.tint && styles.tinted,
               )}
-              style={{ "--tab-tint": item.tint, order: order?.get(item.id) } as CSSProperties}
+              style={
+                {
+                  "--tab-tint": item.tint,
+                  "--tab-tint-strength": item.tintStrength,
+                  order: order?.get(item.id),
+                } as CSSProperties
+              }
               onPointerDown={
                 dnd
                   ? (e) => {
@@ -476,7 +486,7 @@ export function Tabs({
                 {...tooltipAttrs(given(item.tooltip), undefined, true)}
               >
                 {item.icon && <Icon name={item.icon} size={14} className={styles.tabIcon} />}
-                <span className={clsx(styles.tabLabel, item.italic && styles.italic)}>
+                <span className={clsx(styles.tabLabel, item.italic && styles.italic, item.error && styles.error)}>
                   {typeof item.label === "string" ? <Given>{item.label}</Given> : item.label}
                 </span>
                 {item.trailing}

@@ -57,7 +57,7 @@ import { executeAction } from "@/platform/actions";
 import { basename, relativePath, useProject } from "@/platform/project";
 import { editorService } from "@/workbench/contributions";
 import { fileIconName } from "@/ui";
-import { NO_SERVER, debounce, docOf, isUnavailable, lspRequest, reportLspError } from "./lsp";
+import { NO_SERVER, debounce, docOf, isUnavailable, lspDoc, lspRequest, reportLspError } from "./lsp";
 import { offsetToPos, rangeContains, rangeToOffsets } from "./positions";
 import {
   SYNTAX_NOTE,
@@ -89,7 +89,7 @@ import { projectPythonHierarchy, pythonImplementationTargets } from "@/editor/na
 import { importBindings } from "@/editor/navigation/inheritanceGraph";
 import { editorPrefs } from "@/platform/editorSettings";
 import { isVirtualUri, virtualContainer } from "@/platform/virtualDocs";
-import { isAddCaretGesture } from "@/editor/core/cm/multiCaret";
+import { isAddCaretGesture, isRectangularSelectionGesture } from "@/editor/core/cm/multiCaret";
 import { dispatchMouseShortcut, shortcutLabel } from "@/platform/keymap";
 import { isNavigationGesture, onNavigationModifier, navigationModifierHeld } from "@/platform/navigationModifier";
 import { create } from "zustand";
@@ -195,27 +195,25 @@ export async function locationItems(locs: readonly DeclarationTarget[]): Promise
   const root = useProject.getState().project?.root ?? "";
   const names = locs.map((l) => targetLabel(files.get(l.path)?.[l.range.start.line] ?? "", l.range.start.col));
   const indexed = await indexContainers(locs, names);
-  return locs.map((l, i) => {
+  const rows = locs.map((l, i) => {
     const where = chooserWhere(root, l.path, l.range.start.line + 1);
     // Index symbols carry their container; server targets take the index's answer or the enclosing type.
-    if (l.kind && l.name)
-      return {
-        id: `${i}`,
-        label: l.name,
-        detail: [l.container, where].filter(Boolean).join(" · "),
-        symbol: l.kind,
-        location: { path: l.path, line: l.range.start.line },
-        run: () => navigateTo(l),
-      };
-    return {
-      id: `${i}`,
-      label: names[i] ?? basename(l.path),
-      detail: [indexed.get(i) ?? enclosingType(files.get(l.path), l), where].filter(Boolean).join(" · "),
-      icon: fileIconName(basename(l.path), l.path),
-      location: { path: l.path, line: l.range.start.line },
-      run: () => navigateTo(l),
-    };
+    const indexSymbol = !!(l.kind && l.name);
+    const label = indexSymbol ? l.name! : (l.name ?? names[i] ?? basename(l.path));
+    const container = indexSymbol ? l.container : (indexed.get(i) ?? enclosingType(files.get(l.path), l));
+    return { l, where, label, container: container || null, indexSymbol };
   });
+  // Targets that all share one name (the implementations of a method) are told apart, and
+  // speed-searched, by their containers, which become the rows' text.
+  const byContainer = rows.length > 1 && rows.every((r) => r.container && r.label === rows[0]!.label);
+  return rows.map(({ l, where, label, container, indexSymbol }, i) => ({
+    id: `${i}`,
+    label: byContainer ? container! : label,
+    detail: (byContainer ? [where] : [container, where]).filter(Boolean).join(" · "),
+    ...(indexSymbol ? { symbol: l.kind! } : { icon: fileIconName(basename(l.path), l.path) }),
+    location: { path: l.path, line: l.range.start.line },
+    run: () => navigateTo(l),
+  }));
 }
 
 /** "Choose Implementation of foo (3 found)". */
@@ -838,6 +836,7 @@ const linkField = StateField.define<LinkState | null>({
       return {
         pos: v.from,
         above: true,
+        arrow: true,
         create: (view) => {
           const dom = document.createElement("div");
           dom.className = "cm-lsp-hover cm-lsp-nav-info";
@@ -922,6 +921,8 @@ const linkPlugin = ViewPlugin.fromClass(
     private hovered: string | null = null;
     private probeVersion = 0;
     private probeTimer: ReturnType<typeof setTimeout> | undefined;
+    private middleClickVersion = 0;
+    private stopMiddleClick: (() => void) | null = null;
     constructor(readonly view: EditorView) {
       // Window-wide, so ⌘/Ctrl over an unfocused editor underlines too; released anywhere clears it.
       const offModifier = onNavigationModifier((held) => {
@@ -950,11 +951,86 @@ const linkPlugin = ViewPlugin.fromClass(
       };
     }
     destroy() {
+      this.cancelMiddleClick();
       this.off();
       this.offProviders();
       this.disposed = true;
       this.probeVersion++;
       clearTimeout(this.probeTimer);
+    }
+    update(update: ViewUpdate) {
+      if (update.docChanged || update.startState.facet(lspDoc) !== update.state.facet(lspDoc)) this.cancelMiddleClick();
+    }
+    cancelMiddleClick() {
+      this.middleClickVersion++;
+      this.stopMiddleClick?.();
+    }
+    startMiddleClick(event: MouseEvent) {
+      const view = this.view;
+      const pos = view.posAtCoords({ x: event.clientX, y: event.clientY }, false);
+      if (pos == null) return;
+      const source = view.state.doc;
+      const context = docOf(view);
+      const selection = view.state.selection;
+      const version = this.middleClickVersion;
+      const doc = view.contentDOM.ownerDocument;
+      const win = doc.defaultView!;
+      let dragged = false;
+      // Tolerate click jitter, but a real selection must never turn into navigation.
+      const moved = (e: MouseEvent) =>
+        Math.max(Math.abs(e.clientX - event.clientX), Math.abs(e.clientY - event.clientY)) >= 4 ||
+        (view.state.selection !== selection &&
+          (view.state.selection.ranges.length > 1 || !view.state.selection.main.empty));
+      const cancel = () => this.cancelMiddleClick();
+      const stop = () => {
+        doc.removeEventListener("mousemove", move);
+        doc.removeEventListener("mouseup", up);
+        doc.removeEventListener("keydown", cancel, true);
+        win.removeEventListener("mousedown", cancel, true);
+        win.removeEventListener("blur", cancel);
+        if (this.stopMiddleClick === stop) this.stopMiddleClick = null;
+      };
+      const move = (e: MouseEvent) => {
+        if (!(e.buttons & 4)) return cancel();
+        dragged ||= moved(e);
+      };
+      const up = (e: MouseEvent) => {
+        if (e.button !== 1) return;
+        dragged ||= moved(e);
+        doc.removeEventListener("mousemove", move);
+        doc.removeEventListener("mouseup", up);
+        if (
+          dragged ||
+          e.altKey !== event.altKey ||
+          e.ctrlKey !== event.ctrlKey ||
+          e.metaKey !== event.metaKey ||
+          e.shiftKey !== event.shiftKey ||
+          !view.contentDOM.contains(e.target as Node)
+        ) {
+          stop();
+          return;
+        }
+        // CodeMirror's document mouseup handler must finish before we replace its selection.
+        queueMicrotask(() => {
+          stop();
+          if (
+            version !== this.middleClickVersion ||
+            this.disposed ||
+            view.state.doc !== source ||
+            docOf(view) !== context
+          )
+            return;
+          view.dispatch({ selection: EditorSelection.cursor(pos), effects: setLink.of(null) });
+          view.focus();
+          void gotoTargets(view, "definition", pos);
+        });
+      };
+      this.stopMiddleClick = stop;
+      doc.addEventListener("mousemove", move);
+      doc.addEventListener("mouseup", up);
+      doc.addEventListener("keydown", cancel, true);
+      win.addEventListener("mousedown", cancel, true);
+      win.addEventListener("blur", cancel);
     }
     private set(value: LinkState | null) {
       const current = this.view.state.field(linkField);
@@ -1094,10 +1170,17 @@ const linkPlugin = ViewPlugin.fromClass(
         this.show(false);
       },
       mousedown(e, view) {
+        this.cancelMiddleClick();
         if (e.button !== 0 && e.button !== 1) return false;
         if (isAddCaretGesture(e)) return false;
+        const rectangle = isRectangularSelectionGesture(e);
+        let middleDeclaration = false;
         if (
-          dispatchMouseShortcut(e, () => {
+          dispatchMouseShortcut(e, (id) => {
+            if (e.button === 1 && id === "navigate.declaration") {
+              middleDeclaration = true;
+              return false;
+            }
             const pos = view.posAtCoords({ x: e.clientX, y: e.clientY }, false);
             if (pos == null) return false;
             view.dispatch({ selection: EditorSelection.cursor(pos), effects: setLink.of(null) });
@@ -1108,8 +1191,12 @@ const linkPlugin = ViewPlugin.fromClass(
           e.preventDefault();
           return true;
         }
-        // IDEA parity: middle button navigates on a plain click, without the modifier.
-        if (e.button === 1 ? e.metaKey || e.ctrlKey || e.altKey || e.shiftKey : !isNavigationGesture(e)) return false;
+        if (e.button === 1) {
+          if (middleDeclaration || (!e.metaKey && !e.ctrlKey && !e.altKey && !e.shiftKey)) this.startMiddleClick(e);
+          // Do not preventDefault here: CodeMirror still needs the press to start a rectangle.
+          return false;
+        }
+        if (rectangle || !isNavigationGesture(e)) return false;
         if (!navigateFromPointer(view, e)) return false;
         e.preventDefault();
         return true;
@@ -1153,6 +1240,12 @@ const marks = {
   read: Decoration.mark({ class: KIND_CLASS.read }),
   write: Decoration.mark({ class: KIND_CLASS.write }),
 };
+/** The text a multi-line highlight paints with line backgrounds: a line class would also colour its indent. */
+const lineText = {
+  text: Decoration.mark({ class: "cm-lsp-occurrence-text" }),
+  read: Decoration.mark({ class: "cm-lsp-occurrence-text" }),
+  write: Decoration.mark({ class: "cm-lsp-occurrence-text cm-lsp-occurrence-text-write" }),
+};
 const fullLines = {
   text: Decoration.line({ class: KIND_CLASS.text }),
   read: Decoration.line({ class: KIND_CLASS.read }),
@@ -1179,7 +1272,7 @@ function highlightDeco(doc: Text, tabSize: number, items: readonly HighlightItem
       class: i.kind === "write" ? "cm-lsp-occurrence-tail cm-lsp-occurrence-tail-write" : "cm-lsp-occurrence-tail",
       attributes: { style: `--lsp-occurrence-from: calc(${LINE_INSET}px + ${col}ch)` },
     });
-    out.push(tail.range(first.from));
+    out.push(tail.range(first.from), lineText[i.kind].range(i.from, last.from));
     for (let n = first.number + 1; n < last.number; n++) out.push(fullLines[i.kind].range(doc.line(n).from));
     if (i.to > last.from) out.push(marks[i.kind].range(last.from, i.to));
   }

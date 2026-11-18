@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Child;
 use tokio::sync::{mpsc, watch};
@@ -114,8 +114,13 @@ pub(crate) struct Session {
     pub jvm_located: watch::Sender<bool>,
     pub kotlin_mirror: Mutex<Option<crate::kotlin::SourceMirror>>,
     pub jvm_memory: tokio::sync::Mutex<crate::JvmMemoryState>,
+    pub stream_tracer: parking_lot::Mutex<Option<Arc<dyn ide_jvm_inspect::StreamTracer>>>,
+    pub(crate) stream_trace: parking_lot::Mutex<Option<crate::stream_trace::ActiveTrace>>,
+    /// The last trace that finished, until the stop its records were read in ends.
+    pub(crate) stream_trace_done: parking_lot::Mutex<Option<crate::stream_trace::DoneTrace>>,
     /// Used only by a kotlin-lsp session: see [`Session::kotlin_lsp_quirks`].
     pub(crate) quirks: kotlin_lsp::Quirks,
+    pub(crate) unity_startup_activity: Mutex<Instant>,
 }
 
 /// Which threads of the program are suspended: each from its `stopped` event until a
@@ -194,6 +199,13 @@ impl Suspension {
         self.0.lock().ticket
     }
 
+    /// The ticket of a stop of `thread` (its own or every thread's) taken after ticket `after`.
+    pub fn stopped_since(&self, thread: i64, after: u64) -> Option<u64> {
+        let stops = self.0.lock();
+        let own = stops.threads.iter().find(|&&(id, _)| id == thread).map(|&(_, ticket)| ticket);
+        own.max(stops.all).filter(|&ticket| ticket > after)
+    }
+
     /// After a successful resume-like request for `thread`; `all`: every thread ran.
     pub fn resumed(&self, ticket: u64, thread: i64, all: bool) {
         self.0.lock().release(Some(thread), all, ticket);
@@ -269,7 +281,11 @@ impl Session {
             jvm_located: watch::channel(false).0,
             kotlin_mirror: Mutex::new(None),
             jvm_memory: tokio::sync::Mutex::default(),
+            stream_tracer: parking_lot::Mutex::new(None),
+            stream_trace: parking_lot::Mutex::new(None),
+            stream_trace_done: parking_lot::Mutex::new(None),
             quirks: kotlin_lsp::Quirks::default(),
+            unity_startup_activity: Mutex::new(Instant::now()),
         }
     }
 
@@ -716,6 +732,15 @@ pub(crate) async fn event_loop(
 }
 
 async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut body: Value) {
+    if s.adapter == "unity"
+        && event == "output"
+        && body
+            .get("output")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with("Loaded assembly:") || text.starts_with("Resolved pending breakpoint"))
+    {
+        *s.unity_startup_activity.lock() = Instant::now();
+    }
     if let Some(mirror) = s.kotlin_mirror.lock().as_ref() {
         mirror.translate(&mut body);
     }
@@ -724,10 +749,15 @@ async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut bo
     match event {
         "initialized" => {
             s.initialized.send_replace(true);
-            s.emit(DebugEvent::Initialized);
+            if s.adapter != "unity" {
+                s.emit(DebugEvent::Initialized);
+            }
         }
         "stopped" => {
             let all = body.get("allThreadsStopped").and_then(Value::as_bool).unwrap_or(false);
+            if crate::stream_trace::resume_traced_stop(s, int("threadId"), all) {
+                return;
+            }
             s.suspended.stopped(int("threadId"), all);
             let mut reason = str_("reason").unwrap_or_else(|| "pause".into());
             if let Some(quirks) = s.kotlin_lsp_quirks() {
@@ -747,6 +777,7 @@ async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut bo
             // DAP: an event without the flag continues its thread alone. The UI keeps treating
             // it as all threads; the suspension, which holds only threads that stopped, need not.
             s.suspended.continued(int("threadId"), all.unwrap_or(false));
+            crate::stream_trace::release_done(s);
             s.emit(DebugEvent::Continued {
                 thread_id: int("threadId").unwrap_or(0),
                 all_threads_continued: all.unwrap_or(true),
@@ -881,7 +912,7 @@ fn on_reverse_request(mgr: &Arc<DebugManager>, s: &Arc<Session>, seq: i64, comma
 
 /// A `runInTerminal` program and the pseudo-terminal it runs in.
 pub(crate) struct ProgramTerminal {
-    writer: ide_core::input::InputWriter,
+    writer: Arc<ide_core::input::InputWriter>,
     killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
     #[cfg_attr(not(unix), allow(dead_code))]
     pid: Option<u32>,
@@ -948,20 +979,18 @@ pub(crate) fn run_in_terminal(s: &Arc<Session>, args: &Value) -> Result<Value, S
     let mut cmd = CommandBuilder::new(program);
     // CodeLLDB's launcher clears the terminal first; the console keeps the session's earlier output.
     cmd.args(rest.iter().filter(|a| *a != "--clear-screen"));
-    for (k, v) in ide_core::process::host_env_fixes() {
+    let cwd = args.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()).map_or(s.spec.cwd.as_path(), Path::new);
+    for (k, v) in ide_core::process::host_env_fixes_in(cwd) {
         match v {
             Some(v) => cmd.env(k, v),
             None => cmd.env_remove(k),
         }
     }
-    for (k, v) in ide_core::process::shell_env() {
+    for (k, v) in ide_core::process::shell_env_in(cwd) {
         cmd.env(k, v);
     }
     cmd.env("TERM", "xterm-256color");
-    match args.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()) {
-        Some(cwd) => cmd.cwd(cwd),
-        None => cmd.cwd(&s.spec.cwd),
-    }
+    cmd.cwd(cwd);
     if let Some(env) = args.get("env").and_then(Value::as_object) {
         for (k, v) in env {
             match v.as_str() {
@@ -996,10 +1025,12 @@ pub(crate) fn run_in_terminal(s: &Arc<Session>, args: &Value) -> Result<Value, S
         let _ = child.wait();
     })
     .map_err(|e| format!("terminal input worker: {e}"))?;
+    let writer = Arc::new(writer);
     let pid = child.process_id();
     forward_terminal_output(
         s,
         reader,
+        writer.clone(),
         #[cfg(unix)]
         wait_readable,
     );
@@ -1014,10 +1045,35 @@ pub(crate) fn run_in_terminal(s: &Arc<Session>, args: &Value) -> Result<Value, S
     Ok(json!({ "processId": pid }))
 }
 
-/// The program's terminal output, as stdout lines (`\r\n` as `\n`; colours are kept).
+/// A terminal's cursor position query (DSR). ConPTY sends one when it starts and runs the program
+/// only once the terminal answers; programs that lay out a prompt ask it too.
+const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
+/// `chunk` without its cursor position queries, and how many there were.
+pub(crate) fn take_cursor_queries(chunk: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut queries = 0;
+    let mut rest = chunk;
+    while let Some(at) = rest.windows(CURSOR_QUERY.len()).position(|w| w == CURSOR_QUERY) {
+        out.extend_from_slice(&rest[..at]);
+        rest = &rest[at + CURSOR_QUERY.len()..];
+        queries += 1;
+    }
+    out.extend_from_slice(rest);
+    (out, queries)
+}
+
+/// Length of the end of `pending` that may begin a cursor position query the next read completes.
+pub(crate) fn partial_cursor_query(pending: &[u8]) -> usize {
+    (1..CURSOR_QUERY.len()).rev().find(|&n| pending.ends_with(&CURSOR_QUERY[..n])).unwrap_or(0)
+}
+
+/// The program's terminal output, as stdout lines (`\r\n` as `\n`; colours are kept). The debug
+/// console is no terminal, so cursor position queries are answered here (top-left corner).
 fn forward_terminal_output(
     s: &Session,
     mut reader: Box<dyn std::io::Read + Send>,
+    answer: Arc<ide_core::input::InputWriter>,
     #[cfg(unix)] mut wait_readable: impl FnMut() -> std::io::Result<()> + Send + 'static,
 ) {
     let session = s.id;
@@ -1049,11 +1105,20 @@ fn forward_terminal_output(
                     break;
                 }
             }
-            // Keep incomplete UTF-8 sequences, and a `\r` that may start a `\r\n`, for the next chunk.
-            let mut valid = match std::str::from_utf8(&pending) {
-                Ok(_) => pending.len(),
+            let (rest, queries) = take_cursor_queries(&pending);
+            pending = rest;
+            for _ in 0..queries {
+                if let Err(e) = answer.write(b"\x1b[1;1R") {
+                    tracing::warn!(%session, "debug terminal cursor position: {e}");
+                }
+            }
+            // Keep incomplete UTF-8 sequences, a `\r` that may start a `\r\n`, and the start of
+            // a cursor position query for the next chunk.
+            let keep = partial_cursor_query(&pending);
+            let mut valid = match std::str::from_utf8(&pending[..pending.len() - keep]) {
+                Ok(_) => pending.len() - keep,
                 Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                Err(_) => pending.len(),
+                Err(_) => pending.len() - keep,
             };
             if valid > 0 && pending[valid - 1] == b'\r' {
                 valid -= 1;
@@ -1132,6 +1197,7 @@ pub(crate) async fn start_kotlin_debuggee(s: &Arc<Session>, args: &mut Value) ->
     let classpath =
         std::env::join_paths(strings("classPaths")).map_err(|e| ide_core::IdeError::invalid(e.to_string()))?;
     let mut cmd = tokio::process::Command::new(java);
+    cmd.current_dir(&s.spec.cwd);
     ide_core::process::prepare(cmd.as_std_mut());
     cmd.args(kotlin_jvm_args(strings("vmArguments"), cfg!(windows)))
         // Let the JVM pick its own port (`:0`) and report it below: pre-picking a free
@@ -1150,8 +1216,7 @@ pub(crate) async fn start_kotlin_debuggee(s: &Arc<Session>, args: &mut Value) ->
             .ok_or_else(|| ide_core::IdeError::invalid("Missing Kotlin main class"))?,
     )
     .args(strings("programArgs"))
-    .current_dir(&s.spec.cwd)
-    .envs(ide_core::process::shell_env())
+    .envs(ide_core::process::shell_env_in(&s.spec.cwd))
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())

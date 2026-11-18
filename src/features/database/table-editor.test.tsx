@@ -2,9 +2,9 @@ import { act, fireEvent, render, screen } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { DbDriver, DbTablePage } from "@/platform/ipc";
 import { installKeyboardDispatcher, useKeymap } from "@/platform/keymap";
-import { installCellActions } from "./cellActions";
+import { activeCellGrid, installCellActions } from "./cellActions";
 import { getContext } from "@/platform/context";
-import { TableEditor } from "./TableEditor";
+import { TableEditor, _resetTableViewStates } from "./TableEditor";
 import { activeTableEditor, installTableEditorFocus } from "./tableEditorFocus";
 import { tableInput } from "./tableInput";
 
@@ -59,6 +59,7 @@ const page: DbTablePage = {
 };
 
 beforeEach(() => {
+  _resetTableViewStates();
   backend.driver = "clickhouse";
   backend.page.mockResolvedValue({ status: "ok", data: page });
   backend.applyEdits.mockClear();
@@ -128,6 +129,38 @@ describe("table editor capabilities", () => {
     }
   });
 
+  it("runs the row and toolbar commands of the db.* actions on the focused grid's selection (#3506)", async () => {
+    backend.driver = "postgres";
+    const uninstallFocus = installTableEditorFocus();
+    const uninstallCells = installCellActions();
+    try {
+      await act(async () => {
+        render(<TableEditor input={tableInput("source", "public", "users")} />);
+      });
+      const cell = await screen.findByRole("gridcell", { name: "Ann" });
+      fireEvent.mouseDown(cell, { button: 0 });
+      act(() => screen.getByRole("grid").focus());
+      const rows = activeCellGrid()!.selectedRows();
+      expect(rows).toEqual([0]);
+      const commands = activeTableEditor()!.commands!;
+      expect(commands.nextPage!.enabled(rows)).toBe(false);
+      expect(commands.previousPage!.enabled(rows)).toBe(false);
+      expect(commands.exportData!.enabled(rows)).toBe(true);
+      expect(commands.restoreRows!.enabled(rows)).toBe(false);
+      act(() => commands.deleteRows!.run(rows));
+      expect(getContext().dbTableEditorChanges).toBe(true);
+      expect(activeTableEditor()!.commands!.restoreRows!.enabled(rows)).toBe(true);
+      act(() => activeTableEditor()!.commands!.restoreRows!.run(rows));
+      expect(getContext().dbTableEditorChanges).toBe(false);
+      act(() => activeTableEditor()!.commands!.addRow!.run([]));
+      expect(screen.getAllByRole("row").length).toBeGreaterThan(2);
+      expect(getContext().dbTableEditorChanges).toBe(true);
+    } finally {
+      uninstallCells();
+      uninstallFocus();
+    }
+  });
+
   it("counts the editor-area host focusing the tab as table-editor focus (#2307)", async () => {
     backend.driver = "postgres";
     const uninstall = installTableEditorFocus();
@@ -178,4 +211,26 @@ it("omits a reset inserted cell from Submit instead of writing SQL NULL", async 
     disposeKeys();
     disposeActions();
   }
+});
+
+describe("table editor view state", () => {
+  it("queries with the sort it had when its tab mounts again", async () => {
+    const input = tableInput("source", "default", "users");
+    let view!: ReturnType<typeof render>;
+    await act(async () => {
+      view = render(<TableEditor input={input} />);
+    });
+    await screen.findByRole("gridcell", { name: "Ann" });
+    await act(async () => {
+      fireEvent.click(screen.getByRole("columnheader", { name: /name/ }));
+    });
+    const sorted = backend.page.mock.calls.at(-1)!;
+    expect(sorted[5]).toEqual([{ column: "name", descending: false }]);
+    view.unmount();
+    backend.page.mockClear();
+    await act(async () => {
+      render(<TableEditor input={input} />);
+    });
+    expect(backend.page.mock.calls[0]![5]).toEqual(sorted[5]);
+  });
 });

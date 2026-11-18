@@ -27,7 +27,9 @@ import { goBuildType, goTestType } from "./goTypes";
 import { dotnetProjectType, dotnetTestType } from "./dotnetTypes";
 import { rakeType, rspecType, rubyScriptType } from "./rubyTypes";
 import { djangoTestType } from "./djangoTypes";
+import { pythonType } from "./pythonTypes";
 import { phpunitType } from "./phpunitTypes";
+import { UNITY_CONFIG_KIND } from "./unity";
 
 export const COMPOUND = "compound";
 
@@ -475,6 +477,14 @@ const pytest: RunConfigTypeContribution = {
 };
 
 export const BUILTIN_TYPES: readonly RunConfigTypeContribution[] = [
+  {
+    id: UNITY_CONFIG_KIND,
+    label: "Unity Editor",
+    icon: "attach-to-process",
+    debugOnly: true,
+    fields: [],
+    commandLine: () => null,
+  },
   shell,
   program,
   npm,
@@ -482,6 +492,7 @@ export const BUILTIN_TYPES: readonly RunConfigTypeContribution[] = [
   gradle,
   maven,
   godot,
+  pythonType,
   pytest,
   rubyScriptType,
   rakeType,

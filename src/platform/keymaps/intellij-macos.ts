@@ -4,6 +4,7 @@
  */
 export const intellijMacos: Record<string, string[]> = {
   "editor.addOrRemoveCaret": ["Alt+Shift+Button1"],
+  "editor.createRectangularSelectionOnMouseDrag": ["Alt+Button1", "Button2"],
   // Navigate
   "navigate.searchEverywhere": ["Shift Shift"],
   "navigate.gotoClass": ["Meta+O"],
@@ -56,6 +57,7 @@ export const intellijMacos: Record<string, string[]> = {
   "navigate.nextEditLocation": [],
   "navigate.gotoTest": ["Meta+Shift+T"],
   "navigate.superMethod": ["Meta+U"],
+  "navigate.relatedSymbol": ["Ctrl+Meta+Up"],
   "navigate.nextMethod": ["Ctrl+Shift+Down"],
   "navigate.previousMethod": ["Ctrl+Shift+Up"],
   "navigate.nextOccurrence": ["Meta+Alt+Down"],
@@ -171,6 +173,7 @@ export const intellijMacos: Record<string, string[]> = {
   "refactor.inline": ["Meta+Alt+N"],
   "refactor.move": ["F6"],
   "refactor.safeDelete": ["Meta+Delete"],
+  "refactor.extractInterface": [],
   "refactor.pullMembersUp": [],
   "refactor.pushMembersDown": [],
 
@@ -211,6 +214,7 @@ export const intellijMacos: Record<string, string[]> = {
   "project.paste": ["Meta+V"],
   "project.copyAbsolutePath": ["Meta+Shift+C"],
   "project.open": ["F4", "Meta+Down"],
+  "project.openInRightSplit": ["Shift+Enter"],
   "project.findUsages": ["Alt+F7"],
   "project.reformatCode": ["Meta+Alt+L"],
   "project.optimizeImports": ["Ctrl+Alt+O"],
@@ -374,6 +378,17 @@ export const intellijMacos: Record<string, string[]> = {
   "db.goToColumn": ["Meta+F12"],
   "db.submitChanges": ["Meta+Enter"],
   "db.revertChanges": ["Meta+Alt+Z"],
+  // Data editor (table editor / result grid), IDEA's Console.TableResult.* defaults.
+  "db.reloadPage": ["Meta+R"],
+  "db.firstPage": [],
+  "db.previousPage": ["Meta+Alt+Up"],
+  "db.nextPage": ["Meta+Alt+Down"],
+  "db.lastPage": [],
+  "db.addRow": ["Meta+N"],
+  "db.deleteRows": [],
+  "db.restoreRows": [],
+  "db.exportData": [],
+  "db.editCell": [],
   "db.showToolWindow": [],
   "agents.newTask": ["Meta+Shift+I"],
   "agents.focusInput": ["Meta+L"],

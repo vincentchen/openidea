@@ -7,9 +7,10 @@
  */
 import { executeAction, type Action } from "@/platform/actions";
 import { editorPrefs } from "@/platform/editorSettings";
-import { uiFontFamily } from "@/platform/fonts";
+import { uiFontFamily, uiIconFaces } from "@/platform/fonts";
 import { call, commands, isTauri } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
+import { loadSystemFonts, useSystemFontStore } from "@/platform/systemFonts";
 import { setDragRequiresAlt } from "@/ui";
 import { ZOOM_LIMITS } from "@/platform/zoom";
 import { DEFAULT_SETTINGS, validateSettings, type ValidSettings } from "./model/schema";
@@ -38,8 +39,9 @@ export function applyAppearanceOptions(s: ValidSettings, root: HTMLElement = doc
     if (size === DEFAULT_SETTINGS.appearance.uiFontSize) root.style.removeProperty(name);
     else root.style.setProperty(name, `${size + delta}px`);
   }
-  if (a.useCustomFont) root.style.setProperty("--font-ui", uiFontFamily(a.uiFontFamily, a.uiFontFallback));
-  else root.style.removeProperty("--font-ui");
+  if (a.useCustomFont) {
+    root.style.setProperty("--font-ui", `${uiFontFamily(a.uiFontFamily, a.uiFontFallback)}, var(--font-icons)`);
+  } else root.style.removeProperty("--font-ui");
 
   flag(root, "compact", a.compactMode);
   flag(root, "contrastScrollbars", a.contrastScrollbars);
@@ -206,6 +208,26 @@ export function appearanceToggleActions(): Action[] {
   ];
 }
 
+/** View › Appearance › Presentation Assistant. */
+export function presentationAssistantAction(): Action {
+  const enabled = () => validateSettings(useProject.getState().settings).appearance.presentationAssistant.enabled;
+  return {
+    id: "view.togglePresentationAssistant",
+    title: "Presentation Assistant",
+    category: "View",
+    keywords: ["appearance", "show shortcuts", "action names", "screencast", "demo", "key promoter"],
+    toggled: enabled,
+    run: async () => {
+      if (!isTauri()) return;
+      useProject.setState({
+        settings: await call(
+          commands.settingsSet("global", "appearance.presentationAssistant.enabled", JSON.stringify(!enabled())),
+        ),
+      });
+    },
+  };
+}
+
 // ---------------------------------------------------------------------------
 // View › Appearance › Navigation Bar: a radio choice (Top / Status Bar / hidden)
 
@@ -261,5 +283,35 @@ export function installIdleSave(config: () => { enabled: boolean; seconds: numbe
   return () => {
     clearTimeout(timer);
     for (const ev of INPUT_EVENTS) window.removeEventListener(ev, arm, { capture: true });
+  };
+}
+
+/**
+ * Fills `--font-icons` (the end of the UI font stack) with an installed Nerd Font, once the
+ * window is idle: listing the installed families and loading a font WKWebView hides by name
+ * stay off startup. Until then an icon shows as the missing-glyph box.
+ */
+export function installIconFont(root: HTMLElement = document.documentElement): () => void {
+  let cancelled = false;
+  let idleId: number | undefined;
+  const resolve = () =>
+    void loadSystemFonts().then(() => {
+      if (cancelled) return;
+      const { fonts, source } = useSystemFontStore.getState();
+      const installed = source === "native" ? fonts.map((font) => font.name) : undefined;
+      const faces = uiIconFaces(installed);
+      if (faces.length) root.style.setProperty("--font-icons", faces.join(", "));
+    });
+  // Wait past initial startup IPC gaps before scheduling idle font enumeration;
+  // in Chromium/WebView2 `requestIdleCallback` otherwise fires at ~5 ms between startup IPCs.
+  const timer = setTimeout(() => {
+    if (cancelled) return;
+    if (typeof requestIdleCallback === "function") idleId = requestIdleCallback(resolve, { timeout: 5000 });
+    else resolve();
+  }, 500);
+  return () => {
+    cancelled = true;
+    clearTimeout(timer);
+    if (idleId !== undefined && typeof cancelIdleCallback === "function") cancelIdleCallback(idleId);
   };
 }

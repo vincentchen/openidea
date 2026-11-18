@@ -11,7 +11,7 @@ import { call, commands, type Sdk } from "@/platform/ipc";
 import { IconButton, Input, type SelectOption, T } from "@/ui";
 import { JAVA_LANGUAGE_LEVELS, PHP_LANGUAGE_LEVELS } from "@/platform/languageSettings";
 import { GlobListEditor, Row, Section, Select, Toggle } from "../components/Form";
-import { choosePath } from "./api";
+import { choosePath } from "@/platform/choosePath";
 import { usePageContext, useSetting } from "../components/context";
 import { SdkField, tildify, useDetected, useJdtlsJdk } from "./components";
 import styles from "./Sdk.module.css";
@@ -221,6 +221,7 @@ export function PhpPage() {
             emptyText="No include paths"
             itemLabel="Include path"
             aria-label="Include paths"
+            browse={{ directory: true, title: "Choose Include Path" }}
           />
         </Row>
         <Row
@@ -553,6 +554,7 @@ export function GradlePage() {
 export function MavenPage() {
   const [delegateBuild, setDelegateBuild] = useSetting<boolean>("languages.java.maven.delegateBuild");
   const [daemon, setDaemon] = useSetting<boolean>("languages.java.maven.daemon");
+  const [downloadSources, setDownloadSources] = useSetting<boolean>("languages.java.maven.downloadSources");
   const [threads, setThreads] = useSetting<string>("languages.java.maven.threads");
   const [activeProfiles, setActiveProfiles] = useSetting<string>("languages.java.maven.activeProfiles");
   const id = useId();
@@ -564,6 +566,12 @@ export function MavenPage() {
           checked={delegateBuild}
           onChange={setDelegateBuild}
           hint="Run and Debug build Maven modules with Maven (the project's javac) instead of the Java language server. Editor problems still come from the language server."
+        />
+        <Toggle
+          label="Automatically download sources"
+          checked={downloadSources}
+          onChange={setDownloadSources}
+          hint="The Java language server downloads the sources of all dependencies when it imports the project. When off, a library class opens decompiled and its Download Sources banner fetches the sources of that library only."
         />
         <SdkRow
           k="languages.java.maven.runnerJre"
@@ -722,6 +730,29 @@ export function TypeScriptPage() {
             aria-label="tsserver memory limit"
           />
         </Row>
+      </Section>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Zig
+
+export function ZigPage() {
+  return (
+    <div className={styles.page}>
+      <Section>
+        <SdkRow
+          k="languages.zig.zig"
+          label="Zig toolchain"
+          kind="zig"
+          emptyLabel="Auto"
+          emptyDetail="zig on PATH"
+          directory
+          browseTitle="Select Zig Directory"
+          aria-label="Zig toolchain"
+          hint="Zig whose standard library and build.zig.zon packages appear under External Libraries. ZLS must match this Zig version. PATH, Homebrew, zvm and mise / asdf installs are detected."
+        />
       </Section>
     </div>
   );

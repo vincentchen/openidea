@@ -202,7 +202,7 @@ fn ui_modes_are_redetected_without_a_language_change() {
     let opened = rec.log.lock().len();
 
     fs::write(&marker, "{}").unwrap();
-    assert_eq!(docs.ui_mode_of(&template).as_deref(), Some("Angular Template"));
+    assert_eq!(docs.language_of(&template, None).ui_mode.as_deref(), Some("Angular Template"));
     assert_eq!(docs.redetect_languages(), vec![a.id]);
     assert_eq!(docs.snapshot(a.id).unwrap().ui_mode.as_deref(), Some("Angular Template"));
     assert!(docs.redetect_languages().is_empty());
@@ -226,6 +226,39 @@ fn ui_modes_are_redetected_without_a_language_change() {
 
 fn dirty_events(events: &[IdeEvent]) -> Vec<bool> {
     events.iter().filter_map(|e| if let IdeEvent::DocDirty { dirty, .. } = e { Some(*dirty) } else { None }).collect()
+}
+
+#[test]
+fn autosave_leaves_a_file_changed_on_disk_after_an_edit() {
+    let f = fixture();
+    let path = f.root.join("notes.txt");
+    fs::write(&path, "alpha\nbeta\n").unwrap();
+    let info = f.docs.open(&path).unwrap();
+    f.docs.edit(info.id, 0, change(0, 5, "edited")).unwrap();
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    fs::write(&path, "alpha\nbeta external\n").unwrap();
+    f.docs.on_disk_changed(std::slice::from_ref(&path));
+
+    assert!(!f.docs.autosave(info.id).unwrap());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "alpha\nbeta external\n");
+    assert!(f.docs.snapshot(info.id).unwrap().dirty);
+
+    // An explicit save overwrites, as the warning says; autosave works again after it.
+    f.docs.save(info.id).unwrap();
+    assert_eq!(fs::read_to_string(&path).unwrap(), "edited\nbeta\n");
+    f.docs.edit(info.id, 1, change(0, 0, "x")).unwrap();
+    assert!(f.docs.autosave(info.id).unwrap());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "xedited\nbeta\n");
+}
+
+#[test]
+fn closing_a_modified_buffer_reports_it_clean() {
+    let f = fixture();
+    let info = f.docs.open_untitled(None).unwrap();
+    f.docs.edit(info.id, 0, change(0, 0, "draft")).unwrap();
+    assert_eq!(dirty_events(&f.events.lock()), vec![true]);
+    f.docs.close(info.id);
+    assert_eq!(dirty_events(&f.events.lock()), vec![true, false]);
 }
 
 #[test]
@@ -1104,4 +1137,34 @@ fn untitled_buffers_take_file_defaults_and_refuse_encoding_reloads() {
     f.docs.sync_after_disk_change();
     assert!(f.docs.is_dirty(info.id).unwrap());
     assert_eq!(f.docs.snapshot(info.id).unwrap().text, "draft");
+}
+
+/// Previews and diffs show a file in the language opening it gives: from the hashbang of
+/// the shown text (a revision's), else of its open buffer or the file on disk.
+#[test]
+fn language_of_a_closed_file_reads_the_hashbang() {
+    let tmp = tempfile::tempdir().unwrap();
+    let sink: SharedSink = Arc::new(|_: IdeEvent| {});
+    let docs = Documents::new(
+        sink,
+        Box::new(|p: &Path, first: Option<&str>| match first {
+            Some(l) if l.starts_with("#!/usr/bin/env bash") => LanguageId::new("shellscript"),
+            Some(l) if l.starts_with("#!/usr/bin/env python") => LanguageId::new("python"),
+            _ if p.extension().is_some_and(|e| e == "sh") => LanguageId::new("shellscript"),
+            _ => LanguageId::plain_text(),
+        }),
+    );
+    let deploy = tmp.path().join("deploy");
+    fs::write(&deploy, "#!/usr/bin/env bash\necho hi\n").unwrap();
+    let language = |first: Option<&str>| docs.language_of(&deploy, first).language.to_string();
+
+    assert_eq!(language(None), "shellscript", "the file's own first line");
+    assert_eq!(language(Some("#!/usr/bin/env python3")), "python", "the shown revision's first line");
+    assert_eq!(language(Some("echo")), LanguageId::plain_text().to_string());
+    assert_eq!(docs.language_of(&tmp.path().join("gone"), None).language, LanguageId::plain_text());
+
+    let doc = docs.open(&deploy).unwrap();
+    let all = Range::new(Pos::new(0, 0), Pos::new(0, 19));
+    docs.apply_edits(doc.id, &[TextEdit { range: all, new_text: "#!/usr/bin/env python3".into() }]).unwrap();
+    assert_eq!(language(None), "python", "the open buffer's first line");
 }

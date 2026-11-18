@@ -2,7 +2,7 @@
 pub(crate) mod cache;
 
 use crate::Host;
-use crate::rpc::Dispatcher;
+use ide_command::command;
 
 use super::build::load;
 use ide_build::compile;
@@ -13,10 +13,10 @@ use ide_run::BuildPolicy;
 use std::path::PathBuf;
 
 /// Cancellable with `cancel_request(request)`.
-/// Builds the workspace (when `build`), then resolves the runtime (or test)
+/// Builds according to `policy`, then resolves the runtime (or test)
 /// classpath and the JDK of the module at `module` (absolute, or relative to the project root).
 /// A module with Kotlin / Groovy / Scala sources is built by its build system, whose class directories come first.
-/// Resources a Gradle build filters or renames are processed by Gradle, replacing the language server's plain copies.
+#[command(trust = trusted)]
 pub async fn java_resolve_launch(
     host: &Host,
     window: &str,
@@ -25,6 +25,8 @@ pub async fn java_resolve_launch(
     policy: BuildPolicy,
     request: RequestId,
 ) -> IdeResult<JavaLaunchInfo> {
+    // Resources a Gradle build filters or renames are processed by Gradle, replacing the language
+    // server's plain copies.
     host.require_trust(window)?;
     let cancel = host.begin_project_request(window, request);
     let result = resolve_launch(host, window, module, test, policy, &cancel).await;
@@ -32,7 +34,7 @@ pub async fn java_resolve_launch(
     result
 }
 
-async fn resolve_launch(
+pub(crate) async fn resolve_launch(
     host: &Host,
     window: &str,
     module: PathBuf,
@@ -97,6 +99,8 @@ async fn resolve_launch(
     tokio::task::spawn_blocking(move || {
         let _external_build = external_build;
         let local_repo = ide_sdk::apply::maven_local_repository(&project.root, &settings);
+        // Module outputs the launch runs from a snapshot of: the originals must not come back.
+        let mut snapshotted = Vec::new();
         let built = if delegated {
             let rebuild_on_jdt_errors = rebuild_on_jdt_errors(policy, prefer_maven, info.error_count);
             let outputs = project.java_launch_snapshots.lock().build(
@@ -109,6 +113,7 @@ async fn resolve_launch(
             )?;
             let copies = use_snapshot(&mut info, &outputs.originals, &outputs.snapshot);
             apply_external_build_result(&mut info, outputs.failure, outputs.authoritative);
+            snapshotted = outputs.originals;
             copies
         } else if external {
             let built = compile::build_for_launch(&project.root, &model, &module, test, build_kind, &cancel)?;
@@ -137,7 +142,7 @@ async fn resolve_launch(
                 &project.build_cache_dir(),
                 &cancel,
             );
-            merge_maven_launch_classpath(&mut class_paths, &mut info, maven_cp)?;
+            merge_maven_launch_classpath(&mut class_paths, &mut info, maven_cp, &snapshotted)?;
         } else {
             append_unique_class_paths(&mut class_paths, std::mem::take(&mut info.class_paths));
         }
@@ -298,17 +303,23 @@ fn same_entry(a: &str, b: &str, windows: bool) -> bool {
 
 /// Merge the Maven launch classpath without turning a recoverable probe failure into a
 /// failed launch. Cancellation still propagates; ordinary failures keep jdtls' classpath
-/// and leave the reason in the run console.
+/// and leave the reason in the run console. Maven lists the module's and its reactor
+/// siblings' `target/classes`; those in `snapshotted` already run from their snapshot,
+/// and listing both would make every resource (MyBatis mapper XML) load twice.
 fn merge_maven_launch_classpath(
     class_paths: &mut Vec<String>,
     info: &mut JavaLaunchInfo,
     classpath: IdeResult<String>,
+    snapshotted: &[PathBuf],
 ) -> IdeResult<()> {
     match classpath {
         Ok(classpath) => {
+            let snapshotted: Vec<_> = snapshotted.iter().map(|p| p.to_string_lossy()).collect();
             append_unique_class_paths(
                 class_paths,
-                std::env::split_paths(&classpath).map(|path| path.to_string_lossy().into_owned()),
+                std::env::split_paths(&classpath)
+                    .map(|path| path.to_string_lossy().into_owned())
+                    .filter(|path| !snapshotted.iter().any(|original| same_entry(path, original, cfg!(windows)))),
             );
             Ok(())
         }
@@ -364,6 +375,7 @@ fn use_snapshot_on(
 }
 
 /// Port of java-debug's DAP server inside the jdtls serving `module` (started on demand).
+#[command(trust = trusted)]
 pub async fn java_debug_server(host: &Host, window: &str, module: PathBuf) -> IdeResult<u16> {
     host.require_trust(window)?;
     let project = host.project(window)?;
@@ -372,6 +384,7 @@ pub async fn java_debug_server(host: &Host, window: &str, module: PathBuf) -> Id
 }
 
 /// Incremental build of the jdtls workspace serving `module` (e.g. before HotSwap).
+#[command(trust = trusted)]
 pub async fn java_build_workspace(
     host: &Host,
     window: &str,
@@ -388,18 +401,6 @@ pub async fn java_build_workspace(
         host.end_request(id);
     }
     result
-}
-
-/// Commands of this module the remote server answers.
-pub(crate) fn register(d: &mut Dispatcher) {
-    d.add("java_resolve_launch", |c| async move {
-        java_resolve_launch(&c.host, &c.window, c.arg("module")?, c.arg("test")?, c.arg("policy")?, c.arg("request")?)
-            .await
-    });
-    d.add("java_debug_server", |c| async move { java_debug_server(&c.host, &c.window, c.arg("module")?).await });
-    d.add("java_build_workspace", |c| async move {
-        java_build_workspace(&c.host, &c.window, c.arg("module")?, c.arg("request")?).await
-    });
 }
 
 /// An annotation processor's error for writing a file this build already wrote (JDT's
@@ -471,20 +472,46 @@ mod tests {
         let mut class_paths = vec!["snapshot.jar".to_owned()];
         let mut info =
             JavaLaunchInfo { class_paths: vec!["snapshot.jar".into(), "jdtls.jar".into()], ..Default::default() };
-        merge_maven_launch_classpath(&mut class_paths, &mut info, Ok(maven)).unwrap();
+        merge_maven_launch_classpath(&mut class_paths, &mut info, Ok(maven), &[]).unwrap();
         assert_eq!(class_paths, ["snapshot.jar", "maven.jar"]);
 
-        merge_maven_launch_classpath(&mut class_paths, &mut info, Err(IdeError::internal("offline dependency")))
+        merge_maven_launch_classpath(&mut class_paths, &mut info, Err(IdeError::internal("offline dependency")), &[])
             .unwrap();
         assert_eq!(class_paths, ["snapshot.jar", "maven.jar", "jdtls.jar"]);
         assert!(info.hints[0].contains("offline dependency"), "{:?}", info.hints);
+    }
+
+    /// Maven's launch classpath lists the module's and its reactor siblings' outputs, which
+    /// the launch already runs from a snapshot: listed twice, MyBatis loads each mapper XML
+    /// twice and fails with "XML fragments parsed from previous mappers already contains value".
+    #[test]
+    fn maven_classpath_leaves_out_outputs_the_launch_runs_from_a_snapshot() {
+        let web = PathBuf::from("/work/haoke/haoke-web/target/classes");
+        let service = PathBuf::from("/work/haoke/haoke-service/target/classes");
+        let maven = std::env::join_paths([
+            "/work/haoke/haoke-web/target/classes/",
+            "/work/haoke/haoke-service/target/classes",
+            "/work/haoke/haoke-api/target/classes",
+            "/m2/mybatis.jar",
+        ])
+        .unwrap()
+        .to_string_lossy()
+        .into_owned();
+        let mut class_paths = vec!["/cache/launch-x/0".to_owned(), "/cache/launch-x/1".to_owned()];
+        let mut info = JavaLaunchInfo::default();
+        merge_maven_launch_classpath(&mut class_paths, &mut info, Ok(maven), &[web, service]).unwrap();
+        assert_eq!(
+            class_paths,
+            ["/cache/launch-x/0", "/cache/launch-x/1", "/work/haoke/haoke-api/target/classes", "/m2/mybatis.jar"]
+        );
     }
 
     #[test]
     fn cancelled_maven_classpath_probe_propagates_without_fallback() {
         let mut class_paths = vec!["snapshot.jar".to_owned()];
         let mut info = JavaLaunchInfo { class_paths: vec!["jdtls.jar".into()], ..Default::default() };
-        let error = merge_maven_launch_classpath(&mut class_paths, &mut info, Err(IdeError::cancelled())).unwrap_err();
+        let error =
+            merge_maven_launch_classpath(&mut class_paths, &mut info, Err(IdeError::cancelled()), &[]).unwrap_err();
         assert_eq!(error.kind, ErrorKind::Cancelled);
         assert_eq!(class_paths, ["snapshot.jar"]);
         assert!(info.hints.is_empty());
@@ -643,3 +670,5 @@ mod tests {
         }
     }
 }
+
+ide_command::domain!(java: java_build_workspace, java_debug_server, java_resolve_launch);

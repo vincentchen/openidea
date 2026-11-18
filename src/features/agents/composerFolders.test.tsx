@@ -7,6 +7,7 @@ import userEvent from "@testing-library/user-event";
 import { caretOf, setCaret, textOf, typeChars, typeIn } from "./composerTesting";
 import chipStyles from "./ReferenceChip.module.css";
 import { FILES_DRAG, dragSession } from "@/ui";
+import { useProject } from "@/platform/project";
 
 const findFiles = vi.fn();
 const findDirs = vi.fn();
@@ -14,6 +15,7 @@ const pathCompletions = vi.fn();
 const fsProbe = vi.fn();
 const fsEntryKind = vi.fn();
 const findSymbols = vi.fn();
+const agentPrompt = vi.fn((..._args: unknown[]) => Promise.resolve({ status: "ok", data: null }));
 
 vi.mock("@/platform/ipc", async (importOriginal) => {
   const real = await importOriginal<typeof import("@/platform/ipc")>();
@@ -28,14 +30,15 @@ vi.mock("@/platform/ipc", async (importOriginal) => {
       fsProbe: (path: string) => fsProbe(path),
       fsEntryKind: (path: string) => fsEntryKind(path),
       findSymbols: (query: string, filter: string, limit: number) => findSymbols(query, filter, limit),
+      agentPrompt: (...args: unknown[]) => agentPrompt(...args),
     },
   };
 });
 
 import { Composer } from "./Composer";
-import { registerAgentContextSource } from "@/workbench/contributions";
+import { provideNotificationService, registerAgentContextSource } from "@/workbench/contributions";
 import { useEditorRegistry, type TextEditorHandle } from "@/editor/api";
-import { composerDraft, updateComposer } from "./store";
+import { composerDraft, sendMessage, setIdeContext, updateComposer, useAgents } from "./store";
 import { emptyDraft, toPrompt } from "./composerModel";
 
 const ID = "folders-test";
@@ -115,27 +118,74 @@ describe("Composer dropped paths", () => {
     }
     expect(composerDraft(ID).files).toEqual([
       { path: "/p/src/a.ts", rel: "src/a.ts" },
-      { path: "/p/src/dir", rel: "src/dir" },
+      { path: "/p/src/dir", rel: "src/dir/" },
     ]);
-    expect(textOf(box)).toBe("@src/a.ts @src/dir ");
+    expect(textOf(box)).toBe("@src/a.ts @src/dir/ ");
   });
 
   it("deduplicates live references and allows a deleted reference to be dropped again", () => {
     const box = renderComposer();
     drop(box, "/p/src/a.ts\n/p/src/a.ts\n/p/src/dir/");
     drop(box, "/p/src/a.ts\n/p/src/dir/");
-    expect(textOf(box)).toBe("@src/a.ts @src/dir ");
-    typeIn(box, "@src/dir ");
+    expect(textOf(box)).toBe("@src/a.ts @src/dir/ ");
+    typeIn(box, "@src/dir/ ");
     drop(box, "/p/src/a.ts");
-    expect(textOf(box)).toBe("@src/dir @src/a.ts ");
+    expect(textOf(box)).toBe("@src/dir/ @src/a.ts ");
     expect(toPrompt(composerDraft(ID)).files).toEqual(["/p/src/dir", "/p/src/a.ts"]);
   });
 
   it("maps project files and folders into the task worktree, rejecting external paths", () => {
     const box = renderComposer("/worktree");
     drop(box, "/p/src/a.ts\n/p/src/dir/\n/external/a.ts\n/p-other/a.ts\n/p/../external/b.ts\nrelative.ts");
-    expect(textOf(box)).toBe("@src/a.ts @src/dir ");
+    expect(textOf(box)).toBe("@src/a.ts @src/dir/ ");
     expect(toPrompt(composerDraft(ID)).files).toEqual(["/worktree/src/a.ts", "/worktree/src/dir"]);
+  });
+
+  describe("in a workspace", () => {
+    beforeEach(() => {
+      useProject.setState({ project: { root: "/ws", workspace: { projects: ["/p", "/front"] } } as never });
+      return () => useProject.setState({ project: null });
+    });
+
+    it("references the files and folders of another project by its name", () => {
+      const box = renderComposer("/worktree");
+      drop(box, "/front/src/App.vue\n/front/src/views/\n/p/src/a.ts");
+      expect(textOf(box)).toBe("@front/src/App.vue @front/src/views/ @src/a.ts ");
+      expect(toPrompt(composerDraft(ID)).files).toEqual([
+        "/front/src/App.vue",
+        "/front/src/views",
+        "/worktree/src/a.ts",
+      ]);
+    });
+
+    it("says why a path outside the projects is not added", () => {
+      const notify = vi.fn();
+      provideNotificationService({ notify } as never);
+      const box = renderComposer();
+      drop(box, "/external/a.ts\n/front/b.ts");
+      expect(textOf(box)).toBe("@front/b.ts ");
+      expect(notify).toHaveBeenCalledWith(
+        expect.objectContaining({ title: "Only files of this window's projects can be referenced" }),
+      );
+    });
+
+    it("completes the files of every project, named relative to the task or by project", async () => {
+      findFiles.mockReturnValue(
+        ok([
+          { path: "/p/src/agents.ts", relPath: "p/src/agents.ts", score: 40, indices: [2, 3] },
+          { path: "/front/src/App.vue", relPath: "front/src/App.vue", score: 30, indices: [6] },
+        ]),
+      );
+      findDirs.mockReturnValue(ok([]));
+      const box = renderComposer("/worktree");
+      typeIn(box, "@a");
+      const list = await screen.findByRole("listbox");
+      await within(list).findByText("front/src");
+      expect(within(list).getByText("src")).toBeTruthy();
+      await userEvent.keyboard("{ArrowDown}{Enter}");
+      expect(textOf(box)).toBe("@front/src/App.vue ");
+      expect(toPrompt(composerDraft(ID)).files).toEqual(["/front/src/App.vue"]);
+    });
   });
 });
 
@@ -316,8 +366,9 @@ describe("Composer editing", () => {
 });
 
 describe("Composer current file", () => {
-  it("offers the focused editor's file until the draft references it", () => {
+  it("offers the focused editor's file, and adds it with the selection to requests when chosen", () => {
     const view = {} as TextEditorHandle["view"];
+    act(() => setIdeContext(false));
     act(() =>
       useEditorRegistry.setState({ active: { view, ctx: { path: "/p/src/main.ts" } as TextEditorHandle["ctx"] } }),
     );
@@ -326,12 +377,51 @@ describe("Composer current file", () => {
       const offer = screen.getByRole("button", { name: /main\.ts/ });
       expect(offer).toHaveTextContent("Current File");
       fireEvent.click(offer);
-      expect(composerDraft(ID).text).toBe("@src/main.ts ");
-      expect(toPrompt(composerDraft(ID)).files).toEqual(["/p/src/main.ts"]);
+      expect(useAgents.getState().ideContext).toBe(true);
+      expect(composerDraft(ID).text).toBe("");
       expect(screen.queryByRole("button", { name: /main\.ts/ })).toBeNull();
-      expect(document.querySelector("[data-ref-path]")).toHaveAttribute("data-ref-path", "/p/src/main.ts");
+      expect(screen.getByTitle("src/main.ts is added to your request")).toHaveTextContent("Current File");
     } finally {
       act(() => useEditorRegistry.setState({ active: null }));
+    }
+  });
+});
+
+describe("Composer IDE context", () => {
+  it("sends the focused editor's file, or its selected lines, while IDE context is on", async () => {
+    const view = new EditorView({ doc: "a\nb\nc\nd\n" });
+    act(() => setIdeContext(true));
+    act(() =>
+      useEditorRegistry.setState({ active: { view, ctx: { path: "/p/src/main.ts" } as TextEditorHandle["ctx"] } }),
+    );
+    try {
+      renderComposer();
+      expect(screen.queryByRole("button", { name: /main\.ts/ })).toBeNull();
+      expect(screen.getByTitle("src/main.ts is added to your request")).toHaveTextContent("Current File");
+
+      const send = async (text: string) => {
+        updateComposer(ID, { text });
+        await sendMessage(ID, false);
+        return agentPrompt.mock.lastCall?.[1];
+      };
+      expect(await send("explain")).toEqual({ text: "explain", files: ["/p/src/main.ts"], images: [] });
+      // Lines 2–3: the selection ends at the start of line 4.
+      view.dispatch({ selection: { anchor: 2, head: 6 } });
+      expect(await send("explain")).toEqual({
+        text: "explain\n\n@src/main.ts:2-3",
+        files: ["/p/src/main.ts"],
+        images: [],
+      });
+      // A draft that already references the file is sent as written.
+      expect(await send("see @src/main.ts:1")).toEqual({ text: "see @src/main.ts:1", files: [], images: [] });
+
+      fireEvent.click(screen.getByRole("button", { name: "Don't Add the Current File" }));
+      expect(useAgents.getState().ideContext).toBe(false);
+      expect(screen.getByRole("button", { name: /main\.ts/ })).toHaveTextContent("Current File");
+      expect(await send("explain")).toEqual({ text: "explain", files: [], images: [] });
+    } finally {
+      act(() => useEditorRegistry.setState({ active: null }));
+      view.destroy();
     }
   });
 });

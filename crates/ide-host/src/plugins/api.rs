@@ -97,6 +97,26 @@ pub trait PluginWorkspace: Send + Sync {
     fn indexed_files(&self, _root: &Path, _matches: &dyn Fn(&Path) -> bool, _limit: usize) -> Option<Vec<PathBuf>> {
         None
     }
+    /// Sends `method` to the running language server named `server` of the project at
+    /// `root`: a request, or with `notify` a notification (the result is null).
+    #[allow(clippy::too_many_arguments)]
+    fn lsp_request(
+        &self,
+        _root: &Path,
+        server: &str,
+        _method: &str,
+        _params: Option<serde_json::Value>,
+        _notify: bool,
+        _cancel: &CancellationToken,
+        _timeout: Duration,
+    ) -> Result<serde_json::Value, HostError> {
+        Err(HostError::NotFound(format!("no language server `{server}` is running for this project")))
+    }
+    /// What the IDE has resolved of the Maven / Gradle builds of the project at `root`;
+    /// never runs a build tool.
+    fn build_graph(&self, _root: &Path) -> Result<super::BuildGraph, HostError> {
+        Ok(super::BuildGraph::default())
+    }
     /// Current index of the project rooted at `root`; never reads disk or calls LSP.
     fn symbols(
         &self,
@@ -219,7 +239,7 @@ fn network_error(error: reqwest::Error) -> HostError {
         }
         source = e.source();
     }
-    HostError::Failed(error.to_string())
+    HostError::Failed(ide_http::client::describe(&error))
 }
 
 fn redirect_capability(from: &reqwest::Url, to: &reqwest::Url) -> Result<Capability, String> {
@@ -265,6 +285,36 @@ pub(super) enum Waiter {
     Prompt(std::sync::mpsc::SyncSender<Option<Vec<String>>>),
     Commit(std::sync::mpsc::SyncSender<CommitAnswer>),
     Command(std::sync::mpsc::SyncSender<super::CommandAnswer>),
+    Clipboard(std::sync::mpsc::SyncSender<super::ClipboardAnswer>),
+}
+
+/// What a window read from its clipboard, as `ui.read-clipboard` returns it. Oversized text
+/// or images fail here, before the base64 is decoded.
+fn clipboard_content(answer: super::ClipboardAnswer) -> Result<ide_plugin::ClipboardContent, HostError> {
+    use base64::Engine;
+    let (text, png) = match answer {
+        super::ClipboardAnswer::Content { text, png } => (text, png),
+        super::ClipboardAnswer::Refused => return Err(HostError::Denied("clipboard.read (the user refused)".into())),
+        super::ClipboardAnswer::Failed { message } => return Err(HostError::Failed(message)),
+    };
+    let max = ide_plugin::MAX_CLIPBOARD_BYTES;
+    let too_large = || HostError::Failed(format!("the clipboard holds more than {} MiB", max >> 20));
+    // The longest base64 of `max` bytes.
+    if text.as_ref().is_some_and(|t| t.len() > max) || png.as_ref().is_some_and(|p| p.len() > max.div_ceil(3) * 4) {
+        return Err(too_large());
+    }
+    let image = match png.filter(|p| !p.is_empty()) {
+        Some(png) => Some(
+            base64::engine::general_purpose::STANDARD
+                .decode(png)
+                .map_err(|e| HostError::Failed(format!("the clipboard image is not valid base64: {e}")))?,
+        ),
+        None => None,
+    };
+    if image.as_ref().is_some_and(|i| i.len() > max) {
+        return Err(too_large());
+    }
+    Ok(ide_plugin::ClipboardContent { text: text.filter(|t| !t.is_empty()), image })
 }
 
 /// A process a plugin started and has not released (API 1.3 `process.start`).
@@ -662,9 +712,14 @@ impl Shared {
         }
         let previous =
             self.setting_snapshots.lock().insert((client.map(str::to_owned), pkg.id().into()), current.clone());
-        previous
-            .map(|old| current.into_iter().filter(|(k, v)| old.get(k) != Some(v)).map(|(k, _)| k).collect())
-            .unwrap_or_default()
+        match previous {
+            // First contact since the plugin loaded (fresh install, update,
+            // re-enable): hand over every current key, so the synthetic
+            // post-install `settings-changed` wakes the plugin instead of being
+            // dropped for having no diff yet.
+            None => current.into_keys().collect(),
+            Some(old) => current.into_iter().filter(|(k, v)| old.get(k) != Some(v)).map(|(k, _)| k).collect(),
+        }
     }
 
     pub fn status_snapshot(&self, client: &str) -> Vec<super::PluginStatusItem> {
@@ -925,6 +980,17 @@ impl Shared {
             return false;
         }
         let Some(PromptEntry { answer: Waiter::Command(tx), .. }) = prompts.remove(&id) else { return false };
+        tx.try_send(answer).is_ok()
+    }
+
+    /// The window a [`PluginEvent::ClipboardRequested`] went to answered it.
+    pub fn answer_clipboard(&self, client: &str, id: u64, answer: super::ClipboardAnswer) -> bool {
+        let mut prompts = self.prompts.lock();
+        if !matches!(prompts.get(&id), Some(PromptEntry { client: window, answer: Waiter::Clipboard(_), .. }) if window == client)
+        {
+            return false;
+        }
+        let Some(PromptEntry { answer: Waiter::Clipboard(tx), .. }) = prompts.remove(&id) else { return false };
         tx.try_send(answer).is_ok()
     }
 
@@ -1531,13 +1597,8 @@ impl HostApi for PluginApi {
         }
         Ok(())
     }
-    fn open_diff(
-        &self,
-        client: &str,
-        diff: ide_plugin::ContentDiff,
-        file_name: Option<String>,
-    ) -> Result<(), HostError> {
-        super::execution::validate_diff(&diff)?;
+    fn open_diff(&self, client: &str, diff: ide_plugin::FileDiff, file_name: Option<String>) -> Result<(), HostError> {
+        super::execution::validate_file_diff(&diff)?;
         if let Some(name) = &file_name {
             super::execution::label(name, 256)?;
         }
@@ -1868,6 +1929,49 @@ impl HostApi for PluginApi {
         Ok(())
     }
 
+    fn read_clipboard(
+        &self,
+        client: &str,
+        cancel: &CancellationToken,
+    ) -> Result<ide_plugin::ClipboardContent, HostError> {
+        let id = self.shared.next_prompt.fetch_add(1, Ordering::Relaxed);
+        let (answer, answers) = std::sync::mpsc::sync_channel(1);
+        {
+            let closed = self.shared.closed_clients.lock();
+            let blocked = self.shared.prompts_blocked.lock();
+            if closed.contains(client) || blocked.contains(self.id()) {
+                return Err(HostError::Cancelled);
+            }
+            self.shared.prompts.lock().insert(
+                id,
+                PromptEntry {
+                    plugin: self.id().to_owned(),
+                    client: client.to_owned(),
+                    answer: Waiter::Clipboard(answer),
+                },
+            );
+        }
+        let request_id = id.to_string();
+        self.shared.sink.emit(
+            Some(client),
+            PluginEvent::ClipboardRequested { plugin_id: self.id().to_owned(), request_id: request_id.clone() },
+        );
+        // A remote window asks the user first, so there is no deadline: the call's own
+        // cancellation, the plugin stopping or the window closing ends the wait.
+        let answer = loop {
+            match answers.recv_timeout(Duration::from_millis(100)) {
+                Ok(answer) => break answer,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) if !cancel.is_cancelled() => {}
+                Err(_) => {
+                    self.shared.prompts.lock().remove(&id);
+                    self.shared.sink.emit(Some(client), PluginEvent::PromptClosed { prompt_id: request_id });
+                    return Err(HostError::Cancelled);
+                }
+            }
+        };
+        clipboard_content(answer)
+    }
+
     fn open_url(&self, client: Option<&str>, url: String) -> Result<(), HostError> {
         let client = from_window(client, "open a URL")?;
         self.shared.sink.emit(Some(client), PluginEvent::OpenUrl { plugin_id: self.id().to_owned(), url });
@@ -2178,6 +2282,49 @@ impl HostApi for PluginApi {
             cancel,
             deadline,
         )
+    }
+
+    fn lsp_request(
+        &self,
+        root: &Path,
+        server: &str,
+        method: &str,
+        params: Option<String>,
+        notify: bool,
+        cancel: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<String, HostError> {
+        self.require_api("`language-servers`", 9)?;
+        if !ide_lsp::plugin_method_allowed(method) {
+            return Err(HostError::Invalid(format!("`{method}` is not one of the server's own methods")));
+        }
+        let workspace = self
+            .shared
+            .workspace()
+            .ok_or_else(|| HostError::NotFound(format!("no language server `{server}` is running for this project")))?;
+        // The server reads and edits the project on the plugin's behalf, as a process would.
+        if !workspace.trusted(root) {
+            return Err(HostError::Denied("project is not trusted".into()));
+        }
+        let params = params
+            .map(|p| serde_json::from_str(&p).map_err(|e| HostError::Invalid(format!("params are not JSON: {e}"))))
+            .transpose()?;
+        let result = workspace.lsp_request(root, server, method, params, notify, cancel, timeout)?;
+        Ok(result.to_string())
+    }
+
+    fn build_dependencies(
+        &self,
+        root: &Path,
+        module: Option<&str>,
+    ) -> Result<Vec<ide_plugin::DependencyNode>, HostError> {
+        self.require_api("`build`", 10)?;
+        let workspace = self.shared.workspace().ok_or_else(|| HostError::NotFound("no project is open".into()))?;
+        // The graph comes from running the project's build, as `vcs.read` does git.
+        if !workspace.trusted(root) {
+            return Err(HostError::Denied("project is not trusted".into()));
+        }
+        super::build_graph::dependency_nodes(&workspace.build_graph(root)?, module)
     }
 
     fn find_files(&self, root: &Path, glob: &str, limit: usize) -> Result<Vec<String>, HostError> {
@@ -2782,7 +2929,7 @@ impl HostApi for PluginApi {
     }
 
     fn post_view_message(&self, view: &str, message: String) -> Result<(), HostError> {
-        let declared = [super::ui_points::VIEWS, super::ui_points::CUSTOM_EDITORS]
+        let declared = super::ui_points::WEB_POINTS
             .iter()
             .any(|point| self.shared.ui.items(point, Some(self.id())).iter().any(|i| i.key == view));
         if !declared {
@@ -3300,6 +3447,41 @@ impl PluginWorkspace for HostWorkspace {
             Err(e) if e.kind == ide_core::error::ErrorKind::InvalidInput => Err(HostError::Invalid(e.message)),
             Err(e) => Err(HostError::Failed(e.message)),
         }
+    }
+
+    fn lsp_request(
+        &self,
+        root: &Path,
+        server: &str,
+        method: &str,
+        params: Option<serde_json::Value>,
+        notify: bool,
+        cancel: &CancellationToken,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, HostError> {
+        use ide_core::error::ErrorKind;
+        let host = self.0.upgrade().ok_or(HostError::Cancelled)?;
+        let project = HostWorkspace::project_covering(self, root)
+            .ok_or_else(|| HostError::NotFound("the project is no longer open".into()))?;
+        let result = if notify {
+            project.lsp.server_notify(root, server, method, params).map(|()| serde_json::Value::Null)
+        } else {
+            host.runtime.block_on(project.lsp.server_request(root, server, method, params, cancel, timeout))
+        };
+        result.map_err(|e| match e.kind {
+            // A server that stopped while the request was on its way is as absent as one never started.
+            ErrorKind::NotFound | ErrorKind::Unavailable => HostError::NotFound(e.message),
+            ErrorKind::InvalidInput => HostError::Invalid(e.message),
+            ErrorKind::Cancelled => HostError::Cancelled,
+            _ => HostError::Failed(e.message),
+        })
+    }
+
+    fn build_graph(&self, root: &Path) -> Result<super::BuildGraph, HostError> {
+        let host = self.0.upgrade().ok_or(HostError::Cancelled)?;
+        let project = HostWorkspace::project_covering(self, root)
+            .ok_or_else(|| HostError::NotFound("the project is no longer open".into()))?;
+        crate::ops::build::analyzed_dependencies(&project, &host.config_dir, root).map_err(failed)
     }
 
     fn trusted(&self, root: &Path) -> bool {

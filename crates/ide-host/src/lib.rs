@@ -4,8 +4,10 @@
 //! runs one on a remote machine and serves it over JSON-RPC ([`rpc`]).
 
 pub mod agent_secrets;
+pub mod catalogue;
 pub mod data_dirs;
 pub mod diagnostics_store;
+mod direnv;
 pub mod environment;
 mod formatter;
 mod java_runtime;
@@ -23,7 +25,7 @@ pub mod rpc;
 pub mod shell_env;
 pub mod trust;
 
-pub use project::{Project, apply_git_executable, apply_workspace_edit, history_retention};
+pub use project::{Project, apply_git_executable, history_retention};
 
 use ide_core::{CancellationToken, IdeError, IdeResult, RequestId, SharedSink};
 use ide_language::{LanguageRegistry, Syntax};
@@ -91,6 +93,8 @@ pub struct Host {
     pub ssh: Arc<ide_ssh::SshManager>,
     /// SFTP deployment, remote file editing and runs on run targets.
     pub remote: Arc<ide_remote::RemoteService>,
+    /// Tunnels of Docker connections made through an SSH configuration.
+    pub docker_tunnels: ops::docker::DockerTunnels,
     /// What child processes get beyond this process's environment (Reload Environment, `remoteEnv`).
     pub environment: environment::Environment,
     /// The built-in web server (Open In › Browser, the editor's browser bar). On a remote host the
@@ -161,6 +165,7 @@ impl Host {
             agent_secrets: Arc::new(agent_secrets::AgentSecrets::new(&data_dir)),
             remote: Arc::new(ide_remote::RemoteService::new(ssh.clone(), data_dir.join("remote"))),
             ssh,
+            docker_tunnels: Default::default(),
             environment: environment::Environment::new(project_environment, local_data_dir.clone()),
             web: ide_web::WebServer::new(),
             global_settings,
@@ -190,6 +195,13 @@ impl Host {
             open_locks: Default::default(),
         };
         host.apply_proxy();
+        host.apply_added_jdks();
+        // Before any project starts jdtls; the deleting itself can take a while.
+        let unused =
+            ide_sdk::jdtls_workspaces::take_unused(&host.local_data_dir, ide_sdk::jdtls_workspaces::UNUSED_FOR);
+        if !unused.is_empty() {
+            std::thread::spawn(move || ide_sdk::jdtls_workspaces::remove(unused));
+        }
         ops::agent::move_user_mcp_values(&host);
         host
     }
@@ -239,6 +251,16 @@ impl Host {
 
     pub fn require_trust(&self, window: &str) -> IdeResult<()> {
         self.project(window)?.require_trust()
+    }
+
+    /// [`Self::require_trust`] for IDE-wide toolchain work (SDK detection, tool installs) that
+    /// also runs from a window without a project, such as Settings opened from the Welcome
+    /// screen: there is no project there to trust.
+    pub fn require_trust_if_project(&self, window: &str) -> IdeResult<()> {
+        match self.project(window) {
+            Ok(project) => project.require_trust(),
+            Err(_) => Ok(()),
+        }
     }
 
     /// The window that owns what `window` starts.
@@ -307,6 +329,9 @@ impl Host {
         }
         if !project.light {
             self.environment.project_closed();
+            if self.windows_for_root(&project.root).is_empty() {
+                self.environment.direnv_closed(&project.root);
+            }
         }
         if let Some(bridge) = &project.kotlin_bridge {
             bridge.stop();
@@ -528,6 +553,14 @@ impl Host {
 
     pub(crate) fn insert_project(&self, window: &str, project: Arc<Project>) {
         self.projects.write().insert(window.to_owned(), project);
+    }
+}
+
+impl Host {
+    /// Lists the JDKs added by hand (global Settings › SDKs) with the detected ones.
+    pub fn apply_added_jdks(&self) {
+        let homes = self.global_settings.effective().languages.java.added_jdks;
+        ide_sdk::java::set_added_jdks(homes.into_iter().map(PathBuf::from));
     }
 }
 

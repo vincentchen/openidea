@@ -307,6 +307,20 @@ pub struct ChangedFile {
     pub path: String,
     pub kind: ChangeKind,
     pub old_path: Option<String>,
+    /// Set when the entry is a symbolic link (git mode `120000`); only revision diffs fill it.
+    #[serde(default)]
+    #[specta(optional)]
+    pub link: Option<LinkTarget>,
+}
+
+/// What a symbolic link in a revision points to, resolved inside that revision's tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum LinkTarget {
+    Dir,
+    File,
+    /// Dangling, outside the repository (absolute or above its root), or a link loop.
+    Unresolved,
 }
 
 /// Added and deleted lines of one file between two revisions (`git diff --numstat`).
@@ -334,6 +348,10 @@ pub struct RevisionChange {
     pub before: Option<String>,
     /// Commit holding the new content; `None` when the file was deleted.
     pub after: Option<String>,
+    /// Set when the entry is a symbolic link, resolved at `after` (`before`, for a deletion).
+    #[serde(default)]
+    #[specta(optional)]
+    pub link: Option<LinkTarget>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -342,6 +360,10 @@ pub struct Stash {
     pub index: u32,
     pub message: String,
     pub time_ms: f64,
+    /// The stash commit; its changes are those against `base`.
+    pub id: String,
+    /// The commit the stash was made on (the stash commit's first parent).
+    pub base: Option<String>,
 }
 
 /// Push dialog › Push tags: every tag, or only annotated tags on the pushed commits.
@@ -511,9 +533,12 @@ pub enum CheckoutOutcome {
     LocalChanges {
         files: Vec<String>,
     },
-    /// These untracked files (repository-relative paths) would be overwritten.
+    /// These untracked files (repository-relative paths) would be overwritten by the
+    /// checkout; with `removed`, they would be removed by it (tracked here, absent
+    /// from the target).
     UntrackedFiles {
         files: Vec<String>,
+        removed: bool,
     },
     /// Local branch `local` has commits that remote branch `remote` does not.
     LocalBranchAhead {
@@ -627,6 +652,7 @@ pub mod changelists;
 mod cli;
 mod compare;
 mod diff;
+mod external_diff;
 mod history;
 mod ignore;
 mod index_writes;
@@ -653,6 +679,7 @@ pub use cli::{
     set_git_command_observer, set_git_executable,
 };
 pub use diff::build_partial_patch;
+pub use external_diff::{ExternalDiffSide, launch_external_diff};
 pub use ignore::{IgnoreDestination, add_to_ignore};
 pub use manage::{MergeOptions, RebaseOptions, RemoteEdit, Worktree};
 pub use remotes::Remote;
@@ -1157,7 +1184,8 @@ impl Repo {
         write::stage_patch(self, patch, &|path| encoding(path).map(Into::into))
     }
     /// Discards unstaged changes: tracked paths are restored from the index (staged
-    /// changes are kept), untracked files and directories are deleted.
+    /// changes are kept), untracked files and directories are deleted. A submodule goes back
+    /// to the commit the index records, with its tracked files restored.
     pub fn discard(&self, paths: &[PathBuf]) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         write::discard(self, paths)

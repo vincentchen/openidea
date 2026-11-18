@@ -127,6 +127,40 @@ export function resolveTyped(root: string, rel: string): string {
   return isDrive(out[0]) ? out.join("/") : `/${out.join("/")}`;
 }
 
+/** `abs` relative to the first of `bases` it is under ("." for the base itself). */
+export function relativeTo(bases: readonly string[], abs: string): string | null {
+  const source = resolveTyped("", abs.replace(/\\/g, "/"));
+  const base = bases
+    .filter(Boolean)
+    .map((path) => resolveTyped(path, "."))
+    .find((path) => source === path || source.startsWith(`${path}/`));
+  if (!base) return null;
+  return source === base ? "." : source.slice(base.length + 1);
+}
+
+export interface ReferenceRoots {
+  /** The folder the agent works in. */
+  root: string;
+  /** The project `root` is a worktree of (or `root` itself): its files are referenced inside `root`. */
+  projectRoot: string;
+  /** The workspace's projects: the files of another one are referenced by path, named by that project. */
+  members?: readonly string[];
+}
+
+/** How the composer references `abs`: the path it sends and the name written after `@`. */
+export function referenceOf(roots: ReferenceRoots, abs: string): { path: string; rel: string } | null {
+  const own = relativeTo([roots.root, roots.projectRoot], abs);
+  if (own !== null) return { path: resolveTyped(roots.root, own), rel: own };
+  const source = resolveTyped("", abs.replace(/\\/g, "/"));
+  for (const member of roots.members ?? []) {
+    const rel = relativeTo([member], source);
+    if (rel === null) continue;
+    const name = resolveTyped(member, ".").split("/").pop() ?? "";
+    return { path: source, rel: rel === "." ? name : `${name}/${rel}` };
+  }
+  return null;
+}
+
 interface IndexMatch {
   path: string;
   relPath: string;
@@ -317,6 +351,36 @@ export function mentionOf(rel: string, lines?: { from: number; to: number }): st
 export const isMentioned = (text: string, rel: string) =>
   new RegExp(`@${escapeRe(rel)}(?![\\w./-])|@${escapeRe(rel)}:`).test(text);
 
+/** The file in the focused editor and the lines selected in it, for IDE context. */
+export interface IdeContext {
+  path: string;
+  rel: string;
+  /** 1-based lines of a non-empty selection. */
+  lines?: { from: number; to: number };
+}
+
+/**
+ * `draft` with the editor's current file added (as an attachment), or its selection as a
+ * line-range mention after the text; unchanged when the draft already references the file.
+ */
+export function withIdeContext(draft: ComposerDraft, context: IdeContext | null): ComposerDraft {
+  if (
+    !context ||
+    isMentioned(draft.text, context.rel) ||
+    draft.files.some((f) => f.path === context.path && f.attached)
+  )
+    return draft;
+  if (!context.lines)
+    return { ...draft, files: [...draft.files, { path: context.path, rel: context.rel, attached: true }] };
+  const mention = mentionOf(context.rel, context.lines);
+  const text = draft.text.trim();
+  return {
+    ...draft,
+    text: text ? `${text}\n\n${mention}` : mention,
+    files: [...draft.files, { path: context.path, rel: context.rel }],
+  };
+}
+
 /** The prompt to send: attached files, files still mentioned in the text (each once), and the images. */
 export function toPrompt(draft: ComposerDraft): AgentPrompt {
   const seen = new Set<string>();
@@ -349,12 +413,22 @@ export function atEdgeLine(text: string, caret: number, dir: -1 | 1): boolean {
   return dir < 0 ? !text.slice(0, caret).includes("\n") : !text.slice(caret).includes("\n");
 }
 
-const matchesCategory = (o: AgentConfigOption, category: string) =>
-  o.category === category || (category === "model_config" && (o.category === "model_config" || o.id === "fast"));
+export const isContextOption = (id: string) => /^(context_tier|contextTier)$/.test(id);
 
-/** Cursor / ACP model parameters (`fast`, `context`…), separate from the model id itself. */
+/** Whether an option's available values and default belong to the selected model rather than the provider. */
+export const isPerModelOption = (o: AgentConfigOption) =>
+  o.category === "thought_level" || o.category === "context_tier" || isContextOption(o.id);
+
+const matchesCategory = (o: AgentConfigOption, category: string) =>
+  o.category === category ||
+  (category === "model_config" &&
+    (o.category === "model_config" || o.category === "context_tier" || o.id === "fast" || isContextOption(o.id)));
+
+/** Cursor / ACP model parameters (`fast`, `contextTier`…), separate from the model id itself. */
 export function modelConfigOptions(config: readonly AgentConfigOption[]): AgentConfigOption[] {
-  return config.filter((o) => o.category === "model_config" || o.id === "fast");
+  return config.filter(
+    (o) => o.category === "model_config" || o.category === "context_tier" || o.id === "fast" || isContextOption(o.id),
+  );
 }
 
 /** The settings shown in the composer: model, mode, collaboration mode, permissions, approvals, effort, fast. */

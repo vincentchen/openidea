@@ -30,7 +30,7 @@ import {
   compiledDebugPlan,
   contextMenuItems,
   executeContext,
-  launchProduced,
+  debugBinary,
   modifyContext,
   prepareMenu,
   runContextAction,
@@ -63,6 +63,7 @@ import { compoundChildren } from "./configs";
 import { containerDebuggable, remoteDebugBlocked } from "./remote";
 import { debugInContainer } from "./containerDebug";
 import { isDebugOnly, registerBuiltinTypes } from "./types";
+import { isZigBuildStep, zigDebugTarget } from "./zigDebug";
 import { junitType } from "./junitType";
 import { listenForApplicationDeactivation, showApplicationUpdate, updatableSessions } from "./applicationUpdate";
 import { npmGutter } from "./npmGutter";
@@ -92,6 +93,7 @@ import {
   selectConfig,
   selectedConfig,
   startRun,
+  debugSingleInstance,
   startSampleOutput,
   stopSession,
   subscribeOutput,
@@ -104,6 +106,7 @@ import { TEST_TREE_FOCUS, testTree } from "./testTree";
 import { startAgentRun, trimAgentArchive, type AgentRunRequest } from "./agentRuns";
 import { compoundTargets, selectedTarget } from "./sessionTargets";
 import { tx } from "@/platform/i18n";
+import { UNITY_CONFIG_KIND, showUnityAttach } from "./unity";
 
 function trackFailedTestSelection(): () => void {
   let signature = "";
@@ -154,7 +157,11 @@ async function runSelected() {
     useRun.setState({ chooserOpen: true, chooserMode: "run" });
     return;
   }
-  const target = selectedTarget(config.id, useRun.getState().sessions, useDebugRunSessions.getState().sessions);
+  // As in IDEA, Run starts another instance of a configuration that allows multiple instances;
+  // otherwise it restarts the running one.
+  const target = config.allowParallel
+    ? null
+    : selectedTarget(config.id, useRun.getState().sessions, useDebugRunSessions.getState().sessions);
   if (target) {
     target.rerun?.();
     return;
@@ -170,7 +177,12 @@ async function debugConfig(config: RunConfig, chain: readonly string[] = [], sho
     return;
   }
   if (remoteDebugBlocked(config)) return;
+  await debugSingleInstance(config, () => debugLaunch(config, chain, show));
+}
+
+async function debugLaunch(config: RunConfig, chain: readonly string[], show?: boolean): Promise<void> {
   if (!(await prepareLaunch(config, chain, show))) return;
+  if (config.kind === UNITY_CONFIG_KIND) return showUnityAttach(config);
   // Python on a Docker / Compose target: debugpy in the container, the debugger attaches.
   if (containerDebuggable(config) && getAction("debug.attach")) {
     await debugInContainer(config);
@@ -189,7 +201,7 @@ async function debugConfig(config: RunConfig, chain: readonly string[] = [], sho
   // A single compiled file (rustc / clang / zig): build with debug info, then debug the binary.
   const compiled = await compiledDebugPlan(config);
   if (compiled?.debug) {
-    await launchProduced(compiled, true, show);
+    await debugBinary(compiled.debug, config, show);
     return;
   }
   // "Build and run using: Gradle": the JavaExec JVM gets the agent, the debugger attaches to it.
@@ -213,6 +225,21 @@ async function debugConfig(config: RunConfig, chain: readonly string[] = [], sho
   if (jdwpLaunch(config) && getAction("debug.attach")) {
     await debugWithAgent(config, show);
     return;
+  }
+  // `zig build run` (and other steps that run an executable) have no adapter of their own: debug
+  // through the executable config, which builds the binary first and launches it under CodeLLDB.
+  if (isZigBuildStep(config)) {
+    const target = zigDebugTarget(config, useRun.getState().configs);
+    if (target && getAction("debug.startConfig")) {
+      // Run the executable's before-launch build, then keep the clicked step as the session's
+      // origin so the Run widget, tab identity, rerun and stop follow what the user asked to debug.
+      if (!(await prepareLaunch(target, [config.id], show))) return;
+      await executeAction(
+        "debug.startConfig",
+        show === false ? { config: target, origin: config, show: false } : { config: target, origin: config },
+      );
+      return;
+    }
   }
   if (getAction("debug.startConfig")) {
     await executeAction("debug.startConfig", show === false ? { config, show: false } : config);
@@ -487,6 +514,14 @@ export function activate(): () => void {
         icon: "debug",
         when: "projectOpen",
         run: () => debugSelected(),
+      },
+      {
+        id: "run.attachUnity",
+        title: "Attach to Unity Process",
+        category: "Run",
+        icon: "debug",
+        when: "projectOpen",
+        run: () => showUnityAttach(),
       },
       {
         id: "run.runContext",
