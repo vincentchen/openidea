@@ -39,7 +39,6 @@ vi.mock("@tauri-apps/api/core", async (importOriginal) => ({
     onmessage: ((chunk: string) => void) | null = null;
   },
 }));
-
 const fileLink = (text: string): Extract<TerminalLink, { kind: "file" }> => {
   const [l] = findTerminalLinks(text);
   if (!l || l.kind !== "file") throw new Error(`not a file link: ${text}`);
@@ -51,16 +50,17 @@ describe("Windows PTY metadata", () => {
   afterEach(() => usePlatform.setState(initialPlatform));
 
   it.each([
-    ["windows", 19045, { backend: "conpty", buildNumber: 19045 }],
-    ["windows", 22631, { backend: "conpty", buildNumber: 22631 }],
-    ["windows", null, { backend: "conpty", buildNumber: undefined }],
-    ["macos", null, {}],
-    ["linux", null, {}],
-  ] as const)("configures %s build %s", (os, windowsBuildNumber, expected) => {
+    ["windows", 19045, { backend: "conpty", buildNumber: 19045 }, false],
+    ["windows", 22631, { backend: "conpty", buildNumber: 22631 }, true],
+    ["windows", null, { backend: "conpty", buildNumber: undefined }, false],
+    ["macos", null, {}, false],
+    ["linux", null, {}, false],
+  ] as const)("configures %s build %s", (os, windowsBuildNumber, expected, reflowCursorLine) => {
     usePlatform.setState({ os, windowsBuildNumber });
     const session = new TerminalSession({ key: "pty-options", cwd: "/repo", onChange() {}, onFocus() {} });
     try {
       expect(session.term.options.windowsPty).toEqual(expected);
+      expect(session.term.options.reflowCursorLine).toBe(reflowCursorLine);
     } finally {
       session.dispose();
     }
@@ -69,11 +69,39 @@ describe("Windows PTY metadata", () => {
   it("updates a restored terminal when platform info arrives and unsubscribes on disposal", () => {
     usePlatform.setState({ os: "windows", windowsBuildNumber: null });
     const session = new TerminalSession({ key: "restored", cwd: "/repo", onChange() {}, onFocus() {} });
+    expect(session.term.options.reflowCursorLine).toBe(false);
     usePlatform.setState({ windowsBuildNumber: 22631 });
     expect(session.term.options.windowsPty).toEqual({ backend: "conpty", buildNumber: 22631 });
+    expect(session.term.options.reflowCursorLine).toBe(true);
     session.dispose();
     usePlatform.setState({ windowsBuildNumber: 19045 });
     expect(session.term.options.windowsPty).toEqual({ backend: "conpty", buildNumber: 22631 });
+    expect(session.term.options.reflowCursorLine).toBe(true);
+  });
+
+  it.each([
+    ["idle prompt", ""],
+    ["wrapped pending input", "Write-Output 'pending input spanning more than one terminal row"],
+  ])("preserves the %s when a ConPTY session narrows and widens", async (_, input) => {
+    usePlatform.setState({ os: "windows", windowsBuildNumber: 26200 });
+    const session = new TerminalSession({ key: "pty-reflow", cwd: "/repo", onChange() {}, onFocus() {} });
+    try {
+      const prompt = "PS C:\\workspace\\a-long-project-directory\\src> ";
+      const content = prompt + input;
+      const { term } = session;
+      const terminalText = () => {
+        const buffer = term.buffer.active;
+        return Array.from({ length: buffer.length }, (_, i) => buffer.getLine(i)?.translateToString(true)).join("");
+      };
+      term.resize(80, 8);
+      await new Promise<void>((resolve) => term.write(content, resolve));
+      term.resize(30, 8);
+      expect(terminalText()).toBe(content);
+      term.resize(80, 8);
+      expect(terminalText()).toBe(content);
+    } finally {
+      session.dispose();
+    }
   });
 });
 
@@ -214,6 +242,24 @@ describe("openFileLink", () => {
       selection: { line: 1, col: 0 },
       focus: true,
     });
+  });
+
+  it("opens the file a Windows path names, not a same-named one", async () => {
+    ipc.commands.fsReadDir.mockResolvedValue([]);
+    ipc.commands.findFiles.mockImplementation(async (q: string) =>
+      q === "a/main.php"
+        ? [{ path: "C:/p/a/main.php", relPath: "a/main.php" }]
+        : [{ path: "C:/p/c/main.php", relPath: "c/main.php" }],
+    );
+    await openFileLink(fileLink("PHP Warning in a\\main.php:2"), "C:\\p");
+    expect(ipc.commands.fsReadDir).toHaveBeenCalledWith("C:/p/a");
+    expect(workbench.openFile).toHaveBeenCalledWith("C:/p/a/main.php", { selection: { line: 1, col: 0 }, focus: true });
+
+    vi.clearAllMocks();
+    ipc.commands.fsReadDir.mockResolvedValue([{ name: "index.js", kind: "file" }]);
+    await openFileLink(fileLink("at run (D:\\lib\\index.js:3:7)"), "C:\\p");
+    expect(ipc.commands.fsReadDir).toHaveBeenCalledWith("D:/lib");
+    expect(workbench.openFile).toHaveBeenCalledWith("D:/lib/index.js", { selection: { line: 2, col: 6 }, focus: true });
   });
 
   it("falls back to the bare name for a basename-only link", async () => {
@@ -450,5 +496,96 @@ describe("terminal font zoom", () => {
     syncTerminalProject(null);
     syncTerminalProject("/font-zoom");
     for (const tab of useTerminals.getState().tabs) expect(getSession(tab.session)!.term.options.fontSize).toBe(18);
+  });
+});
+
+describe("terminal tab spinner state (#3831)", () => {
+  beforeEach(() => vi.clearAllMocks());
+
+  const feed = async (session: TerminalSession, ...chunks: string[]) => {
+    for (const chunk of chunks) {
+      await new Promise<void>((resolve) => session.term.write(chunk, resolve));
+    }
+  };
+
+  it("lets a program's OSC 9;4 progress decide the spinner over the OSC 133 boundaries", async () => {
+    const session = new TerminalSession({ key: "s-progress", cwd: "/repo", onChange() {}, onFocus() {} });
+    try {
+      // An agent CLI is one command to the shell: C at launch, D only at exit.
+      await feed(session, "\x1b]133;C\x07");
+      expect(session.state).toMatchObject({ commandRunning: true, progress: null });
+      // The agent works on a turn (indeterminate progress), then sits idle at its
+      // own input prompt: the report clears while the command is still running.
+      await feed(session, "\x1b]9;4;3\x07");
+      expect(session.state).toMatchObject({ commandRunning: true, progress: "active" });
+      await feed(session, "\x1b]9;4;0\x07");
+      expect(session.state).toMatchObject({ commandRunning: true, progress: "cleared" });
+      // The next turn reports again, with a progress value attached.
+      await feed(session, "\x1b]9;4;1;75\x07");
+      expect(session.state).toMatchObject({ progress: "active" });
+      // The CLI exits: the command boundary clears the stale report too.
+      await feed(session, "\x1b]133;D;0\x07");
+      expect(session.state).toMatchObject({ commandRunning: false, progress: null });
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("starts each command without the previous program's progress report", async () => {
+    const session = new TerminalSession({ key: "s-progress-reset", cwd: "/repo", onChange() {}, onFocus() {} });
+    try {
+      await feed(session, "\x1b]133;C\x07", "\x1b]9;4;0\x07");
+      expect(session.state.progress).toBe("cleared");
+      await feed(session, "\x1b]133;D;0\x07", "\x1b]133;C\x07");
+      expect(session.state).toMatchObject({ commandRunning: true, progress: null });
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("leaves the spinner decision to OSC 133 for programs that never report progress", async () => {
+    const session = new TerminalSession({ key: "s-progress-none", cwd: "/repo", onChange() {}, onFocus() {} });
+    try {
+      // OSC 9 payloads that are not progress reports (iTerm2 notifications, …)
+      // and a malformed report change nothing.
+      await feed(session, "\x1b]133;C\x07", "\x1b]9;notify: done\x07", "\x1b]9;4;\x07");
+      expect(session.state).toMatchObject({ commandRunning: true, progress: null });
+      await feed(session, "\x1b]133;D\x07");
+      expect(session.state).toMatchObject({ commandRunning: false, progress: null });
+    } finally {
+      session.dispose();
+    }
+  });
+
+  it("stops the spinner of a non-shell command tab when the process exits", async () => {
+    ipc.commands.fsEntryKind.mockResolvedValue("dir");
+    ipc.commands.termSpawn.mockResolvedValue({ id: 11, title: "claude" });
+    const session = new TerminalSession({
+      key: "s-custom-exit",
+      cwd: "/repo",
+      onChange() {},
+      onFocus() {},
+      command: { program: "claude", args: [] },
+    });
+    await session.start();
+    expect(session.state).toMatchObject({ status: "running", commandRunning: true, progress: null });
+    session.exited(0);
+    expect(session.state).toMatchObject({ status: "exited", commandRunning: false, progress: null });
+    session.dispose();
+  });
+
+  it("stops the spinner of a non-shell command tab that fails to start", async () => {
+    ipc.commands.fsEntryKind.mockResolvedValue("dir");
+    ipc.commands.termSpawn.mockRejectedValue(new Error("no claude"));
+    const session = new TerminalSession({
+      key: "s-custom-error",
+      cwd: "/repo",
+      onChange() {},
+      onFocus() {},
+      command: { program: "claude", args: [] },
+    });
+    await session.start();
+    expect(session.state).toMatchObject({ status: "error", commandRunning: false, progress: null });
+    session.dispose();
   });
 });

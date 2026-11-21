@@ -4,14 +4,22 @@
  * requests into the `generated-requests.http` scratch and open it.
  */
 import { RangeSet, StateEffect, StateField, type EditorState, type Extension } from "@codemirror/state";
-import { EditorView, GutterMarker, ViewPlugin, gutter, type ViewUpdate } from "@codemirror/view";
-import { activeEditor, intentionProviders, type ContributedIntention, type EditorDocContext } from "@/editor/api";
+import { EditorView, GutterMarker, ViewPlugin, type ViewUpdate } from "@codemirror/view";
+import {
+  activeEditor,
+  iconAreaSource,
+  intentionProviders,
+  mapLineStart,
+  type ContributedIntention,
+  type EditorDocContext,
+} from "@/editor/api";
 import { appendGeneratedRequests } from "../generatedRequests";
 import { call, commands } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
 import { isVirtualUri } from "@/platform/virtualDocs";
 import { gutterIconMarkup, showContextMenu, type MenuItem } from "@/ui";
 import { notifications, type MenuGroupContext } from "@/workbench/contributions";
+import { constantPool } from "./constants";
 import { springAt, springControllers, type Controller, type Endpoint } from "./endpoints";
 import { bodyLookup, findHost, renderRequest, skeleton, type SourceReader } from "./request";
 import { parseSource } from "./source";
@@ -31,6 +39,11 @@ export const sourceReader: SourceReader = {
   },
   filesNamed: (name) => call(commands.findFilesNamed(name)),
 };
+
+/** Controllers of `text`, with the other classes' constants loaded so far. */
+function controllersIn(text: string): Controller[] {
+  return springControllers(text, (file) => constantPool().resolverFor(file));
+}
 
 /** One request per endpoint (`paths[i]` picks another path of the mapping). */
 export interface Target {
@@ -102,7 +115,7 @@ function controllerItems(sourcePath: string, text: string, c: Controller): MenuI
 
 /** Editor context menu items for the caret at `offset`: the generate actions (a path choice for several paths). */
 export function springMenuItems(sourcePath: string, text: string, offset: number): MenuItem[] {
-  const { controller, endpoint } = springAt(springControllers(text), offset);
+  const { controller, endpoint } = springAt(controllersIn(text), offset);
   const items: MenuItem[] = [];
   if (endpoint)
     items.push(
@@ -129,7 +142,7 @@ export async function generateAtCaret(scope: "endpoint" | "controller"): Promise
   const e = activeEditor();
   if (!e || !SPRING_LANGUAGES.has(e.ctx.language)) return;
   const text = e.view.state.doc.toString();
-  const { controller, endpoint } = springAt(springControllers(text), e.view.state.selection.main.head);
+  const { controller, endpoint } = springAt(controllersIn(text), e.view.state.selection.main.head);
   const endpoints = scope === "endpoint" ? (endpoint ? [endpoint] : []) : (controller?.endpoints ?? []);
   if (!endpoints.length) {
     notifications().notify({
@@ -163,7 +176,7 @@ const marksField = StateField.define<Mark[]>({
   update(value, tr) {
     for (const e of tr.effects) if (e.is(setMarks)) return e.value;
     if (!tr.docChanged || !value.length) return value;
-    return value.map((m) => ({ ...m, pos: tr.state.doc.lineAt(tr.changes.mapPos(m.pos, -1)).from }));
+    return value.map((m) => ({ ...m, pos: mapLineStart(tr, m.pos) }));
   },
 });
 
@@ -171,7 +184,7 @@ function computeMarks(state: EditorState): Mark[] {
   const doc = state.doc;
   const marks: Mark[] = [];
   const lineStart = (offset: number) => doc.lineAt(Math.min(offset, doc.length)).from;
-  for (const c of springControllers(doc.toString())) {
+  for (const c of controllersIn(doc.toString())) {
     if (c.endpoints.length)
       marks.push({
         pos: lineStart(c.offset),
@@ -201,6 +214,7 @@ class SpringMarker extends GutterMarker {
   override toDOM(): Node {
     const el = document.createElement("div");
     el.className = styles.runMarker ?? "";
+    el.dataset.iconSource = "spring";
     el.title = this.mark.title;
     el.setAttribute("role", "button");
     el.setAttribute("aria-label", this.mark.title);
@@ -231,9 +245,18 @@ export function springEditorExtension(ctx: EditorDocContext): Extension {
           const same =
             cur.length === found.length && cur.every((m, i) => m.pos === found[i]!.pos && m.key === found[i]!.key);
           if (!same) this.view.dispatch({ effects: setMarks.of(found) });
+          // Paths built from other classes' constants: load those classes, then mark again.
+          if (found.length) {
+            const pool = constantPool();
+            void pool.load([parseSource(this.view.state.doc.toString())]).then((loaded) => {
+              if (loaded && pool === constantPool() && !this.destroyed) this.schedule(0);
+            });
+          }
         }, delay);
       }
+      destroyed = false;
       destroy() {
+        this.destroyed = true;
         clearTimeout(this.timer);
       }
     },
@@ -242,7 +265,7 @@ export function springEditorExtension(ctx: EditorDocContext): Extension {
     // Only files that have mappings (the gutter found some) are parsed again here.
     if (!view.state.field(marksField, false)?.length) return [];
     const text = view.state.doc.toString();
-    const { controller, endpoint } = springAt(springControllers(text), view.state.selection.main.head);
+    const { controller, endpoint } = springAt(controllersIn(text), view.state.selection.main.head);
     const out: ContributedIntention[] = [];
     if (endpoint)
       out.push({
@@ -269,23 +292,23 @@ export function springEditorExtension(ctx: EditorDocContext): Extension {
     marksField,
     detector,
     intentionProviders.of(intentions),
-    gutter({
-      class: `${styles.runGutter} cm-openidea-gutter-spring`,
+    // In the shared icon area, after the run icons.
+    iconAreaSource.of({
+      order: 30,
       markers: (view) =>
         RangeSet.of(
           view.state.field(marksField).map((m) => new SpringMarker(m).range(m.pos)),
           true,
         ),
-      domEventHandlers: {
-        mousedown: (view, block, event) => {
-          const mark = view.state.field(marksField).find((m) => m.pos === block.from);
-          if (!mark || (event as MouseEvent).button !== 0) return false;
-          const el = (event.target as HTMLElement).closest?.(`.${styles.runMarker}`) as HTMLElement | null;
-          const rect = (el ?? (event.target as HTMLElement)).getBoundingClientRect();
-          event.preventDefault();
-          showContextMenu({ x: rect.left, y: rect.bottom + 2 }, mark.items(path, view.state.doc.toString()));
-          return true;
-        },
+      mousedown: (view, block, event) => {
+        if (event.button !== 0) return false;
+        const el = (event.target as HTMLElement).closest?.('[data-icon-source="spring"]') as HTMLElement | null;
+        const mark = el && view.state.field(marksField).find((m) => m.pos === block.from);
+        if (!el || !mark) return false;
+        const rect = el.getBoundingClientRect();
+        event.preventDefault();
+        showContextMenu({ x: rect.left, y: rect.bottom + 2 }, mark.items(path, view.state.doc.toString()));
+        return true;
       },
     }),
   ];

@@ -3,9 +3,11 @@
  * "Terminal" tool window (tabs, split tab groups, links, IDEA-style shortcuts),
  * plus the CLI editor tabs (#2202): full-size agent CLIs as editor-area tabs.
  */
+import { createElement } from "react";
 import { registerActions } from "@/platform/actions";
 import { onIdeEvent } from "@/platform/ipc";
 import { useProject } from "@/platform/project";
+import { useSystemFontStore } from "@/platform/systemFonts";
 import { onWorkflowSettingsChange } from "@/platform/workflowSettings";
 import {
   provideEmbeddedTerminal,
@@ -15,10 +17,11 @@ import {
   toolWindowService,
 } from "@/workbench/contributions";
 import { lazyComponent } from "@/ui";
-import { CLI_KIND, cliData, moveTerminalToEditor } from "./cli";
+import { CLI_KIND, CliDoneMark, cliData, moveTerminalToEditor } from "./cli";
 import { installTerminalKeys } from "./keys";
 import { loadTerminalRuntime, terminalRuntime } from "./loader";
 import { SAMPLE_TUI_END, SAMPLE_TUI_START, sampleTuiFrame } from "./sampleTui";
+import { notifyTerminalVisibility } from "./outputGate";
 import type { SessionOptions } from "./session";
 
 const WINDOW = "terminal";
@@ -128,6 +131,8 @@ export function activate(): () => void {
       component: lazyComponent(() => loadTerminalRuntime().then((rt) => rt.CliEditor)),
       title: (input) => cliData(input)?.name ?? "Terminal",
       icon: () => "terminal",
+      // A finished command not seen yet (#3712).
+      trailing: (input) => createElement(CliDoneMark, { inputKey: input.key }),
       // A reopened tab shows Start: nothing runs on its own.
       restorable: true,
       keepAlive: true,
@@ -317,10 +322,24 @@ export function activate(): () => void {
         terminalRuntime()?.applySettingsToClis();
       }
     }),
+    // Prompt-theme icons (oh-my-posh, starship) come from the user's installed Nerd Font.
+    // Faces beyond the known list are discovered once the native font catalog loads (off
+    // startup), so open terminals re-apply their font stack then (#3723).
+    useSystemFontStore.subscribe((s, prev) => {
+      if (s.fonts === prev.fonts) return;
+      terminalRuntime()?.applySettingsToAll();
+      terminalRuntime()?.applySettingsToClis();
+    }),
     onIdeEvent("terminalExited", (e) => {
       const rt = terminalRuntime();
       (rt?.sessionForTerminalId(e.terminal) ?? rt?.cliSessionForTerminalId(e.terminal))?.exited(e.code);
     }),
+    (() => {
+      if (typeof document === "undefined") return () => {};
+      const onVisibility = () => notifyTerminalVisibility();
+      document.addEventListener("visibilitychange", onVisibility);
+      return () => document.removeEventListener("visibilitychange", onVisibility);
+    })(),
     // Sessions belong to the project. Remember this project's tabs, then open the next one's.
     useProject.subscribe((s, prev) => {
       const rt = terminalRuntime();

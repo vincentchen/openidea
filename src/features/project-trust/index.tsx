@@ -5,6 +5,7 @@ import { call, commands, onIdeEvent, type TrustDecisions, type TrustStatus } fro
 import { dirname, useProject } from "@/platform/project";
 import { initializeRemoteTrustMigration, isRemoteRoot } from "@/platform/remote";
 import { provideProjectTrustPrompt, type ProjectTrustScope } from "@/platform/projectTrust";
+import { askOverSplash } from "@/platform/splash";
 import { invokeLocal } from "@/platform/tauriCore";
 import { registerOverlay, registerSettingsPage, registerWorkbenchBanner } from "@/workbench/contributions";
 import { Button, Checkbox, Dialog, T } from "@/ui";
@@ -139,6 +140,14 @@ function TrustSettings() {
       setError(String(e));
     }
   };
+  const trust = async (path: string) => {
+    try {
+      await call(commands.projectTrustSet(path, true, false));
+      await refresh();
+    } catch (e) {
+      setError(String(e));
+    }
+  };
   const addLocation = async () => {
     try {
       const { open } = await import("@/platform/dialog");
@@ -168,6 +177,24 @@ function TrustSettings() {
           </Button>
         </div>
       ))}
+      {decisions?.restricted.length ? (
+        <>
+          <h3>
+            <T>Restricted projects</T>
+          </h3>
+          <p className={styles.hint}>
+            <T>These projects open in Restricted Mode, even inside a trusted location.</T>
+          </p>
+          {decisions.restricted.map((path) => (
+            <div className={styles.row} key={path}>
+              <span className={styles.path}>{path}</span>
+              <Button onClick={() => void trust(path)}>
+                <T>Trust</T>
+              </Button>
+            </div>
+          ))}
+        </>
+      ) : null}
       <div className={styles.sectionHead}>
         <h3>
           <T>Trusted locations</T>
@@ -177,7 +204,7 @@ function TrustSettings() {
         </Button>
       </div>
       <p className={styles.hint}>
-        <T>Every project inside a trusted location is trusted without asking.</T>
+        <T>Every project inside a trusted location is trusted without asking, unless it is a restricted project.</T>
       </p>
       {decisions?.locations.map((path) => (
         <div className={styles.row} key={path}>
@@ -209,7 +236,7 @@ async function decide(trusted: boolean) {
 
 function promptForTrust(status: TrustStatus, scope: ProjectTrustScope): Promise<boolean> {
   usePrompt.getState().finish?.(false);
-  return new Promise<boolean>((resolve) =>
+  const answer = new Promise<boolean>((resolve) =>
     usePrompt.setState({
       path: status.root,
       scope,
@@ -220,6 +247,8 @@ function promptForTrust(status: TrustStatus, scope: ProjectTrustScope): Promise<
       },
     }),
   );
+  askOverSplash(answer);
+  return answer;
 }
 
 async function trustProject() {

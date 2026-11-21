@@ -33,6 +33,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("gdscript", include_str!("../../../languages/gdscript.toml")),
     ("gdshader", include_str!("../../../languages/gdshader.toml")),
     ("go", include_str!("../../../languages/go.toml")),
+    ("gherkin", include_str!("../../../languages/gherkin.toml")),
     ("gomod", include_str!("../../../languages/gomod.toml")),
     ("gowork", include_str!("../../../languages/gowork.toml")),
     ("godot-resource", include_str!("../../../languages/godot-resource.toml")),
@@ -89,6 +90,7 @@ const BUILTIN: &[(&str, &str)] = &[
     ("toml", include_str!("../../../languages/toml.toml")),
     ("typescript", include_str!("../../../languages/typescript.toml")),
     ("typescriptreact", include_str!("../../../languages/typescriptreact.toml")),
+    ("typst", include_str!("../../../languages/typst.toml")),
     ("vue", include_str!("../../../languages/vue.toml")),
     ("xml", include_str!("../../../languages/xml.toml")),
     ("yaml", include_str!("../../../languages/yaml.toml")),
@@ -369,6 +371,7 @@ impl LanguageRegistry {
     pub fn framework_ui_mode(&self, language: &LanguageId, path: &Path, project_root: Option<&Path>) -> Option<String> {
         let state = self.state();
         let cfg = state.languages.iter().find(|l| &l.id == language)?;
+        let path = &*crate::project_spelling(path, |p| project_root.is_none_or(|root| p.starts_with(root)));
         cfg.framework_ui_modes
             .iter()
             .find(|f| crate::marked_root(project_root, path, &f.root_markers).is_some())
@@ -611,6 +614,7 @@ mod tests {
         "TTCN",
         "TTCN_CFG",
         "Turtle",
+        "Typst",
         "Web IDL",
         "VB.NET",
         "VBScript",
@@ -626,6 +630,7 @@ mod tests {
         "Vue",
         "Angular Template",
         "Angular TypeScript",
+        "Thymeleaf",
         "ERB",
         "JSP",
         "Astro",
@@ -666,19 +671,33 @@ mod tests {
     }
 
     #[test]
+    fn rainbow_bracket_nodes_reach_the_ui() {
+        let reg = reg();
+        let tsx = reg.get(&LanguageId::new("typescriptreact")).unwrap();
+        assert_eq!(tsx.rainbow_brackets.angle, ["TypeArgList", "TypeParamList"]);
+        assert!(tsx.rainbow_brackets.tags.iter().any(|t| t == "JSXOpenTag"));
+        let info = crate::LanguageInfo::from(&reg.get(&LanguageId::new("html")).unwrap());
+        assert_eq!(info.rainbow_brackets.tags, ["OpenTag", "CloseTag", "SelfClosingTag"]);
+        let json = serde_json::to_value(&info).unwrap();
+        assert_eq!(json["rainbowBrackets"]["tags"][0], "OpenTag");
+        // Definitions without the table, as most are, get none.
+        assert_eq!(reg.get(&LanguageId::new("python")).unwrap().rainbow_brackets, Default::default());
+    }
+
+    #[test]
     fn alternative_servers_are_fallbacks() {
         let reg = reg();
         for (lang, servers) in [
             ("python", vec!["basedpyright", "pyright", "ty", "pyrefly"]),
             ("typescript", vec!["vtsls", "typescript-language-server"]),
-            ("java", vec!["jdtls", "kmp-lsp"]),
+            ("java", vec!["jdtls", "java-analyzer", "kmp-lsp"]),
             ("kotlin", vec!["kotlin-lsp", "kotlin-language-server", "kmp-lsp"]),
         ] {
             let cfg = reg.get(&LanguageId::new(lang)).unwrap();
             let got: Vec<(&str, bool)> = cfg
                 .language_servers
                 .iter()
-                .filter(|s| !s.require_root_marker)
+                .filter(|s| !s.require_root_marker && s.features.is_empty())
                 .map(|s| (s.name.as_str(), s.fallback))
                 .collect();
             let expected: Vec<(&str, bool)> = servers.iter().enumerate().map(|(i, name)| (*name, i > 0)).collect();
@@ -758,7 +777,10 @@ mod tests {
         let cfg = reg.get(&LanguageId::new("php")).unwrap();
         let names: Vec<&str> = cfg.language_servers.iter().map(|s| s.name.as_str()).collect();
         // After the fallback: hover, rename and symbols stay with Intelephense.
-        assert_eq!(names, ["intelephense", "phpactor", "laravel-lsp"]);
+        assert_eq!(names, ["intelephense", "phpactor", "phoxite", "laravel-lsp"]);
+        // Phoxite answers the Laravel strings itself.
+        let phoxite = cfg.language_servers.iter().find(|s| s.name == "phoxite").unwrap();
+        assert!(phoxite.fallback && phoxite.replaces == ["laravel-lsp"]);
         let lsp = cfg.language_servers.iter().find(|s| s.name == "laravel-lsp").unwrap();
         assert_eq!(lsp.command.as_str(), "laravel-lsp");
         // Its `lsp` command takes no options and speaks over stdio; `--stdio` stops it at startup.
@@ -776,12 +798,25 @@ mod tests {
     }
 
     #[test]
+    fn pylsp_adds_only_rope_refactorings_to_python() {
+        let reg = reg();
+        let cfg = reg.get(&LanguageId::new("python")).unwrap();
+        let pylsp = cfg.language_servers.iter().find(|s| s.name == "pylsp").unwrap();
+        assert!(!pylsp.fallback && !pylsp.require_root_marker);
+        assert_eq!(pylsp.features, ["code-action"]);
+        assert_eq!(pylsp.code_action_kinds, ["refactor"]);
+        let plugins = pylsp.initialization_options.as_ref().unwrap()["pylsp"]["plugins"].as_table().unwrap();
+        assert_eq!(plugins["jedi_completion"]["enabled"].as_bool(), Some(false));
+        assert!(plugins.values().all(|p| p["enabled"].as_bool() == Some(false)));
+    }
+
+    #[test]
     fn ruff_serves_python_files_only_below_its_config() {
         let reg = reg();
         let cfg = reg.get(&LanguageId::new("python")).unwrap();
         let names: Vec<&str> = cfg.language_servers.iter().map(|s| s.name.as_str()).collect();
         // After the fallbacks: hover, rename and symbols stay with the type checker.
-        assert_eq!(names, ["basedpyright", "pyright", "ty", "pyrefly", "ruff"]);
+        assert_eq!(names, ["basedpyright", "pyright", "ty", "pyrefly", "ruff", "pylsp"]);
         let ruff = cfg.language_servers.iter().find(|s| s.name == "ruff").unwrap();
         assert_eq!((ruff.command.as_str(), ruff.args.as_slice()), ("ruff", ["server".to_string()].as_slice()));
         assert!(ruff.require_root_marker && !ruff.fallback);
@@ -821,6 +856,23 @@ mod tests {
         assert_eq!(mode("typescriptreact", "apps/web/src/app/app.tsx"), None);
         assert!(reg.is_framework_marker(&root.join("apps/admin/angular.json")));
         assert!(!reg.is_framework_marker(&root.join("apps/admin/package.json")));
+    }
+
+    #[test]
+    fn spring_template_folders_make_html_thymeleaf() {
+        let reg = reg();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let mode = |file: &str| reg.framework_ui_mode(&LanguageId::new("html"), &root.join(file), Some(root));
+        std::fs::create_dir_all(root.join("web/src/main/resources/templates/fragments")).unwrap();
+        std::fs::create_dir_all(root.join("docs")).unwrap();
+        for file in
+            ["web/src/main/resources/templates/index.html", "web/src/main/resources/templates/fragments/nav.html"]
+        {
+            assert_eq!(mode(file).as_deref(), Some("Thymeleaf"), "{file}");
+        }
+        assert_eq!(mode("docs/index.html"), None);
+        assert!(reg.is_framework_marker(&root.join("web/src/main/resources/templates")));
     }
 
     #[test]
@@ -875,6 +927,38 @@ mod tests {
         assert_eq!(detect("shop/templates/shop/product_list.html"), "django-html");
         assert_eq!(detect("shop/templates/shop/email/order.txt"), "django-html");
         assert_eq!(detect("pages/promo.html"), "html");
+    }
+
+    /// #4061: the project root is canonical; a template reached under another
+    /// spelling of it is still the project's.
+    #[test]
+    fn templates_spelt_differently_from_the_project_use_framework_modes() {
+        let reg = reg();
+        let tmp = tempfile::tempdir().unwrap();
+        let root = dunce::canonicalize(tmp.path()).unwrap().join("Develop/shop");
+        std::fs::create_dir_all(root.join("node_modules/@angular/core")).unwrap();
+        let template = root.join("apps/myapp/src/app/example.component.html");
+        std::fs::create_dir_all(template.parent().unwrap()).unwrap();
+        std::fs::write(&template, "<button (click)=\"onConfirm()\">Confirm</button>\n").unwrap();
+        let mode = |path: &Path| reg.framework_ui_mode(&LanguageId::new("html"), path, Some(&root));
+        let links = tempfile::tempdir().unwrap();
+        let mut spellings = Vec::new();
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(&root, links.path().join("shop")).unwrap();
+            spellings.push(links.path().join("shop").join(template.strip_prefix(&root).unwrap()));
+        }
+        // Only on a case-insensitive disk (macOS, Windows): `develop` for `Develop`.
+        let lower = PathBuf::from(template.to_string_lossy().replace("Develop", "develop"));
+        if lower.exists() {
+            spellings.push(lower);
+        }
+        for path in &spellings {
+            assert_eq!(mode(path).as_deref(), Some("Angular Template"), "{}", path.display());
+        }
+        // Still nothing for files that are elsewhere under every spelling.
+        std::fs::create_dir_all(links.path().join("other")).unwrap();
+        assert_eq!(mode(&links.path().join("other/index.html")), None);
     }
 
     #[test]
@@ -1054,6 +1138,7 @@ mod tests {
             ("CMakeLists.txt", "cmake"),
             ("api.proto", "proto"),
             ("schema.graphql", "graphql"),
+            ("checkout.feature", "gherkin"),
             ("schema.prisma", "prisma"),
             ("main.tf", "terraform"),
             ("prod.tfvars", "terraform-vars"),

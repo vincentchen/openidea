@@ -21,6 +21,7 @@ import clsx from "clsx";
 import { Button, Dialog, Icon, IconButton, Input, List, ProgressBar, SearchField, Select, Spinner, T } from "@/ui";
 import { useSettingsForm } from "@/workbench/contributions";
 import { confirm } from "@/workbench/messages";
+import { isPerModelOption } from "./composerModel";
 import { providerIcon } from "./model";
 import {
   DISTRIBUTION_LABEL,
@@ -93,9 +94,19 @@ export function agentRows(providers: AgentProvider[], registry: RegistryAgent[],
   ];
 }
 
+/** Live registry update version once loaded, falling back to the cached provider snapshot before it arrives. */
+function registryUpdate(provider: AgentProvider | null, registry?: RegistryAgent | null): string | null {
+  if (provider && provider.source.kind !== "registry") return null;
+  if (registry) return registry.installed != null && registry.update ? registry.version : null;
+  return provider?.source.kind === "registry" ? provider.source.update : null;
+}
+
 /** What the agent needs, if anything, as a trailing tag in the list. */
-export function agentStatus(agent: AgentProvider): { label: string; tone: "muted" | "accent" } | null {
-  if (agent.source.kind === "registry" && agent.source.update) return { label: "Update", tone: "accent" };
+export function agentStatus(
+  agent: AgentProvider,
+  registry?: RegistryAgent | null,
+): { label: string; tone: "muted" | "accent" } | null {
+  if (registryUpdate(agent, registry)) return { label: "Update", tone: "accent" };
   if (agent.commandOverridden || agent.source.kind === "custom") return { label: "Custom", tone: "accent" };
   if (!agent.installed) return { label: "Not found", tone: "muted" };
   return null;
@@ -103,8 +114,8 @@ export function agentStatus(agent: AgentProvider): { label: string; tone: "muted
 
 function AgentItem({ agent, working }: { agent: Agent; working: boolean }) {
   const status = agent.provider
-    ? agentStatus(agent.provider)
-    : agent.registry?.installed != null && agent.registry.update
+    ? agentStatus(agent.provider, agent.registry)
+    : registryUpdate(null, agent.registry)
       ? ({ label: "Update", tone: "accent" } as const)
       : null;
   return (
@@ -508,8 +519,7 @@ function Details({
   const installed = provider?.source.kind === "registry" || (!provider && registry?.installed != null);
   const isCustom = provider?.source.kind === "custom";
   const canInstall = registry?.distribution != null;
-  const update =
-    provider?.source.kind === "registry" ? provider.source.update : registry?.update ? registry.version : null;
+  const update = registryUpdate(provider, registry);
   const facts = provider
     ? [providerStatus(provider)]
     : [
@@ -575,7 +585,7 @@ function Details({
       {job && (
         <div className={styles.progress}>
           <ProgressBar value={job.fraction} aria-label={tx`Installing ${agent.name}`} />
-          <span className={styles.hint}>{job.message}</span>
+          <span>{job.message}</span>
         </div>
       )}
       {!job && installed && update && <p className={styles.notice}>{tx`${update} is available`}</p>}
@@ -965,7 +975,7 @@ function ExternalLink({ url, label }: { url: string; label: string }) {
 
 /** The options a new task of `agent` starts with: each the agent's own default unless chosen. */
 export function defaultOptions(agent: AgentProvider, chosen: Record<string, string>): AgentConfigOption[] {
-  const base = agent.config.filter((o) => o.category !== "thought_level" && o.values.length > 1);
+  const base = agent.config.filter((o) => !isPerModelOption(o) && o.values.length > 1);
   const modelOption = base.find((o) => o.category === "model");
   const model = (modelOption && chosen[modelOption.id]) || modelOption?.current;
   const levels = (model && agent.thoughtLevels?.[model]) || [];

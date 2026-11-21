@@ -38,6 +38,7 @@ import { workflowSettings } from "@/platform/workflowSettings";
 import { ask, confirm } from "@/workbench/messages";
 import {
   activeSchema,
+  collapseTarget,
   colorVar,
   connectRemedy,
   databaseKey,
@@ -56,6 +57,8 @@ import { formatted } from "./sql/format";
 import { bindParams, findParams } from "./sql/params";
 import { isReadOnlyQuery } from "./sql/readOnly";
 import { pageFetch } from "./resultView";
+import type { TableSnapshot } from "./schemaCompare";
+import { resolutionScopeOf, resolutionScopesOf, type SqlResolutionScope } from "./resolutionScopes";
 import { databaseRequest, invalidateDatabaseRequests, projectRequest } from "./requests";
 import { tx } from "@/platform/i18n";
 
@@ -87,6 +90,18 @@ export interface ResultTab {
   total?: number | null;
   /** Kept when the console runs again (Pin Tab); results otherwise replace the console's last ones. */
   pinned?: boolean;
+  /** Shown in the editor under its statement (In-Editor Results), not as a result tab. */
+  inline?: boolean;
+}
+
+/** Database › In-Editor Results: result sets show under their statements instead of in result tabs. */
+export function inEditorResults(settings: unknown = useProject.getState().settings): boolean {
+  return (settings as { database?: { inEditorResults?: unknown } } | null)?.database?.inEditorResults === true;
+}
+
+export async function setInEditorResults(on: boolean): Promise<void> {
+  const settings = await call(commands.settingsSet("global", "database.inEditorResults", JSON.stringify(on)));
+  useProject.setState({ settings });
 }
 
 /** One line of the consoles' Output log (IDEA's Database Console output). */
@@ -116,6 +131,11 @@ export type DialogState =
   /** Confirm Drop / Truncate, with a preview of the statement. */
   | { kind: "drop"; id: string; object: DbObjectRef }
   | { kind: "truncate"; id: string; schema: string; table: string }
+  /** New › Database of data source `id`; New › Schema in target `id`. */
+  | { kind: "createDatabase"; id: string }
+  | { kind: "createSchema"; id: string }
+  /** Drop on database `database` of data source `id`. */
+  | { kind: "dropDatabase"; id: string; database: string }
   /** Modify Table (`table` null: New › Table); `focusColumn` selects a column, `addColumn` starts a new one. */
   | { kind: "modifyTable"; id: string; schema: string; table: string | null; focusColumn?: string; addColumn?: boolean }
   /** Quick Documentation of a tree node, shown at `anchor` (client coordinates). */
@@ -130,7 +150,17 @@ export type DialogState =
   /** Browse Query History of target `id`; Paste goes to console `path`. */
   | { kind: "history"; id: string; path: string | null }
   /** Import Data from File into a table. */
-  | { kind: "import"; id: string; schema: string; table: string };
+  | { kind: "import"; id: string; schema: string; table: string }
+  /** Compare Structure: `source` starts as the schema the action was invoked on. */
+  | { kind: "compareSchemas"; source: { id: string; schema: string } | null }
+  /** Export with 'pg_dump' of a database, schema or table. */
+  | { kind: "dump"; target: string; database: string; schemas?: string; tables?: string; serverVersion: number | null }
+  /** Restore with 'pg_restore' / 'psql' into a database. */
+  | { kind: "restore"; target: string; database: string; serverVersion: number | null }
+  /** Export with 'mysqldump' of a data source, database or table. */
+  | { kind: "mysqlDump"; target: string; database: string; tables?: string }
+  /** Restore with 'mysql' into a database. */
+  | { kind: "mysqlRestore"; target: string; database: string };
 
 /** The schemas and tables of a data source's databases, as far as introspection has read them. */
 export interface SourceCatalog {
@@ -164,11 +194,11 @@ interface DatabaseState {
   consoles: Record<string, string>;
   /** Console path → its active schema (unqualified names resolve there; see `consoleSchema`). */
   consoleSchemas: Record<string, string>;
-  /** The Database tree's quick object filter (empty: everything shows). */
-  treeFilter: string;
   separateProceduresAndFunctions: boolean;
   completion: Record<string, DbCompletion>;
   results: ResultTab[];
+  /** Results shown in the editor under their statements (In-Editor Results), oldest first. */
+  inline: ResultTab[];
   /** Result tab id, or `OUTPUT_TAB`. */
   activeResult: number | null;
   output: OutputLine[];
@@ -233,10 +263,10 @@ export const useDatabase = create<DatabaseState>(() => ({
   objects: {},
   consoles: readBindings(),
   consoleSchemas: readConsoleSchemas(),
-  treeFilter: "",
   separateProceduresAndFunctions: readSeparateProceduresAndFunctions(),
   completion: {},
   results: [],
+  inline: [],
   activeResult: null,
   output: [],
   running: {},
@@ -301,6 +331,8 @@ function sourceMutation(id: string): () => boolean {
 }
 
 export async function loadSources(): Promise<void> {
+  // Closing the project resets `loaded` while its SQL consoles are still mounted.
+  if (!useProject.getState().project) return;
   const request = ++sourcesRequest;
   const current = projectRequest();
   const intents = new Map(connectionIntents);
@@ -406,12 +438,8 @@ export async function duplicateSource(id: string): Promise<void> {
 export async function renameSource(id: string, name: string): Promise<void> {
   const src = sourceById(id);
   if (!src || !name.trim() || name.trim() === src.name) return;
-  const sources = useDatabase.getState().sources.map((s) => (s.id === src.id ? { ...s, name: name.trim() } : s));
-  forget(id);
-  const current = sourceMutation(id);
-  await call(commands.dbSaveSources(sources));
-  if (!current()) return;
-  await loadSources();
+  // Saved like any edit, so what the tree had loaded under the source is loaded again.
+  await saveSource({ ...src, name: name.trim() }, undefined);
 }
 
 /** Removes the data source after asking (Database tree › Drop on a source). */
@@ -492,6 +520,7 @@ const lastUsed = new Map<string, number>();
 function applyConnectDefaults(id: string) {
   if (
     sourceById(id)?.driver !== "clickhouse" &&
+    sourceById(id)?.driver !== "jdbc" &&
     sourceById(id)?.options?.transaction === "manual" &&
     !useDatabase.getState().manualCommit.has(id)
   )
@@ -540,6 +569,7 @@ export async function disconnect(id: string): Promise<void> {
   if (!targets.includes(id)) targets.push(id);
   const current = projectRequest();
   forget(id);
+  useDatabase.setState((s) => ({ treeExpanded: collapseTarget(s.treeExpanded, id) }));
   const intent = {};
   for (const target of targets) connectionIntents.set(target, intent);
   if (!splitTarget(id).database) sourceConnectionIntents.set(id, {});
@@ -588,6 +618,20 @@ export function listsDatabases(source: DataSource | undefined): boolean {
     (source?.driver === "postgres" || source?.driver === "sqlServer" || source?.driver === "snowflake") &&
     !source.options?.singleDatabase
   );
+}
+
+/** New › Database and Drop on database nodes: PostgreSQL and SQL Server data sources that show their databases. */
+export function createsDatabases(source: DataSource | undefined): boolean {
+  return listsDatabases(source) && source?.driver !== "snowflake";
+}
+
+/** The target New › Schema creates a schema in: a database node, or a data source that shows schemas directly. */
+export function newSchemaTarget(n: DbNode): string | null {
+  if (n.kind === "database") return createsDatabases(sourceById(n.id)) ? n.id : null;
+  if (n.kind !== "source" || !n.source.id) return null;
+  const driver = n.source.driver;
+  if (driver !== "postgres" && driver !== "sqlServer" && driver !== "mysql") return null;
+  return listsDatabases(n.source) ? null : n.source.id;
 }
 
 interface LoadedLevels {
@@ -694,6 +738,25 @@ export async function loadTables(id: string, schema: string): Promise<void> {
     if (!current()) return;
     useDatabase.setState((s) => ({ tables: { ...s.tables, [key]: { status: "error", message: message(e) } } }));
   }
+}
+
+/** The tables of `schema` on target `id` with their columns, indexes and foreign keys (Compare Structure). */
+export async function schemaSnapshot(id: string, schema: string, signal?: AbortSignal): Promise<TableSnapshot[]> {
+  const tables = (await withConnection(id, () => call(commands.dbTables(id, schema)))).filter(
+    (t) => t.kind === "table",
+  );
+  const out: TableSnapshot[] = [];
+  let next = 0;
+  const worker = async () => {
+    while (next < tables.length) {
+      if (signal?.aborted) return;
+      const t = tables[next++]!;
+      const details = await call(commands.dbTableDetails(id, schema, t.name));
+      out.push({ name: t.name, kind: t.kind, ...details });
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(4, tables.length) }, worker));
+  return out;
 }
 
 export async function loadDetails(id: string, schema: string, table: string): Promise<void> {
@@ -872,7 +935,10 @@ export function bindConsole(path: string, id: string | null) {
 export function consoleSchema(path: string): string {
   const s = useDatabase.getState();
   const id = consoleSource(path);
-  return activeSchema(s.consoleSchemas[path], id ? s.completion[id]?.defaultSchema : undefined);
+  // A scope's schema applies while the console is on that scope's data source.
+  const scope = s.consoles[path] ? null : scopeOf(path);
+  const picked = s.consoleSchemas[path] ?? (scope && scope.dataSource === id ? scope.schema : undefined);
+  return activeSchema(picked || undefined, id ? s.completion[id]?.defaultSchema : undefined);
 }
 
 /** Sets (or clears, for `null`) the console's active schema and remembers it per console file. */
@@ -890,11 +956,26 @@ export function setConsoleSchema(path: string, schema: string | null) {
   });
 }
 
-/** The data source a console / SQL file runs on: its binding, else the only data source. */
+/** The SQL resolution scope of file `path` (Languages & Frameworks › SQL Resolution Scopes), if any. */
+function scopeOf(path: string): SqlResolutionScope | null {
+  const { project, settings } = useProject.getState();
+  if (!project) return null;
+  const sources = useDatabase.getState().sources;
+  return resolutionScopeOf(path, project.root, resolutionScopesOf(settings), (id) =>
+    sources.some((x) => x.id === splitTarget(id).id),
+  );
+}
+
+/**
+ * The data source a console / SQL file runs on and resolves against: the one picked in its
+ * toolbar, else its SQL resolution scope's, else the only data source.
+ */
 export function consoleSource(path: string): string | null {
   const s = useDatabase.getState();
   const bound = s.consoles[path];
   if (bound && s.sources.some((x) => x.id === splitTarget(bound).id)) return bound;
+  const scope = scopeOf(path);
+  if (scope) return scope.dataSource;
   return s.sources.length === 1 ? (s.sources[0]!.id ?? null) : null;
 }
 
@@ -904,6 +985,29 @@ export async function openConsole(id: string): Promise<void> {
     const path = await call(commands.dbConsolePath(id));
     bindConsole(path, id);
     await editorService().openFile(path, { focus: true });
+  } catch (e) {
+    notifications().notify({ level: "error", title: "Cannot open the query console", body: message(e) });
+  }
+}
+
+/** The query console files of data source `id`: `console.sql`, then `console_1.sql`, `console_2.sql`… */
+export function consoleFiles(id: string): Promise<string[]> {
+  return call(commands.dbConsoles(id, false));
+}
+
+/** Opens one of the query consoles of data source `id`. */
+export async function openConsoleFile(id: string, path: string): Promise<void> {
+  bindConsole(path, id);
+  await editorService().openFile(path, { focus: true });
+}
+
+/** Creates and opens another query console of data source `id` (DataGrip's New › Query Console). */
+export async function newConsole(id: string): Promise<void> {
+  try {
+    const before = new Set(await consoleFiles(id));
+    const after = await call(commands.dbConsoles(id, true));
+    const path = after.find((p) => !before.has(p)) ?? after[after.length - 1];
+    if (path) await openConsoleFile(id, path);
   } catch (e) {
     notifications().notify({ level: "error", title: "Cannot open the query console", body: message(e) });
   }
@@ -1005,6 +1109,38 @@ export async function runSql(id: string, texts: string[]): Promise<boolean> {
       notifications().notify({ level: "error", title: `Cannot execute on ${targetLabel(id)}`, body: message(e) });
     return false;
   }
+}
+
+/**
+ * Creates a database on data source `id` with `sql` after disconnecting `template`, then refreshes
+ * the data source, reloading what the tree had shown of `template` too.
+ */
+export async function createDatabase(id: string, template: string, sql: string): Promise<boolean> {
+  const levels = loadedLevels(id);
+  await disconnect(`${id}:${template}`);
+  try {
+    // Asks for a password the data source does not save, like any statement it runs.
+    await withConnection(id, () => call(commands.dbCreateDatabase(id, template, sql)));
+  } catch (e) {
+    notifications().notify({ level: "error", title: tx`Cannot create database`, body: message(e) });
+    void refresh(id, levels);
+    return false;
+  }
+  void refresh(id, levels);
+  return true;
+}
+
+/** Drops `database` of data source `id` with `sql` after disconnecting it, then refreshes the data source. */
+export async function dropDatabase(id: string, database: string, sql: string): Promise<boolean> {
+  await disconnect(`${id}:${database}`);
+  try {
+    await withConnection(id, () => call(commands.dbDropDatabase(id, database, sql)));
+  } catch (e) {
+    notifications().notify({ level: "error", title: tx`Cannot drop database ${database}`, body: message(e) });
+    return false;
+  }
+  void refresh(id);
+  return true;
 }
 
 /** Opens the query console of `id` with `text` appended and selected (SQL Scripts › …). */
@@ -1121,6 +1257,10 @@ export async function executeConsole(
       const title = index === 1 ? tx`Result ${n}` : tx`Result ${n}-${index}`;
       return { id: nextTab++, title, path, sourceId: id, schema, outcome, page: 0, pageSize };
     });
+    if (inEditorResults()) {
+      useDatabase.setState((s) => ({ inline: [...s.inline, ...tabs.map((t) => ({ ...t, inline: true }))] }));
+      return outcomes;
+    }
     const failed = outcomes.some((o) => o.error);
     useDatabase.setState((s) => ({
       results: replaceResults(s.results, path, tabs),
@@ -1212,7 +1352,7 @@ async function explain(id: string, statement: SqlStatement, schema?: string): Pr
 /** Explain Plan: the plan of the statement at `from` (the first selected one) of console `path`. */
 export async function explainConsole(path: string, text: string, from: number, to: number): Promise<void> {
   const id = consoleSource(path);
-  if (!id) return;
+  if (!id || sourceById(id)?.driver === "jdbc") return;
   try {
     const [statement] = await consoleStatements(id, text, from, to);
     if (!statement) return;
@@ -1262,7 +1402,7 @@ export async function openObjectDdl(id: string, schema: string, kind: DbObjectKi
 
 /** Re-runs the statement of result tab `tabId`, replacing its rows (a plan tab explains it again). */
 export async function rerunResult(tabId: number): Promise<void> {
-  const tab = useDatabase.getState().results.find((r) => r.id === tabId);
+  const tab = findResult(tabId);
   if (!tab || tab.busy) return;
   if (tab.plan) {
     patchResult(tabId, { busy: true });
@@ -1285,8 +1425,16 @@ export function pageable(tab: ResultTab): boolean {
   return !tab.plan && isReadOnlyQuery(tab.outcome.statement.text, sourceById(tab.sourceId)?.driver ?? "sqlite");
 }
 
+/** Result tab `tabId`, in the Services view or in an editor. */
+export function findResult(tabId: number): ResultTab | undefined {
+  const st = useDatabase.getState();
+  return st.results.find((r) => r.id === tabId) ?? st.inline.find((r) => r.id === tabId);
+}
+
 function patchResult(tabId: number, p: Partial<ResultTab>) {
-  useDatabase.setState((s) => ({ results: s.results.map((r) => (r.id === tabId ? { ...r, ...p } : r)) }));
+  const patch = (list: ResultTab[]) =>
+    list.some((r) => r.id === tabId) ? list.map((r) => (r.id === tabId ? { ...r, ...p } : r)) : list;
+  useDatabase.setState((s) => ({ results: patch(s.results), inline: patch(s.inline) }));
 }
 
 /**
@@ -1295,7 +1443,7 @@ function patchResult(tabId: number, p: Partial<ResultTab>) {
  * `rerun` also forgets the counted total.
  */
 export async function loadResultPage(tabId: number, page: number, pageSize: number, rerun = false): Promise<void> {
-  const tab = useDatabase.getState().results.find((r) => r.id === tabId);
+  const tab = findResult(tabId);
   if (!tab || tab.busy || tab.plan) return;
   if (page > 0 && !pageable(tab)) return;
   patchResult(tabId, { busy: true });
@@ -1343,7 +1491,7 @@ export function countable(tab: ResultTab): boolean {
 
 /** Counts the rows of result tab `tabId`'s whole query (the pager's "of 501+"). */
 export async function countResult(tabId: number): Promise<number | null> {
-  const tab = useDatabase.getState().results.find((r) => r.id === tabId);
+  const tab = findResult(tabId);
   if (!tab || tab.busy || !countable(tab)) return null;
   const text = countQuery(tab.outcome.statement.text)!;
   patchResult(tabId, { busy: true });
@@ -1381,7 +1529,7 @@ function setPending(id: string, pending: boolean) {
 
 /** Commits or rolls back the open transaction of a manual-commit data source. */
 export async function finishTransaction(id: string, commit: boolean): Promise<boolean> {
-  if (sourceById(id)?.driver === "clickhouse") return false;
+  if (sourceById(id)?.driver === "clickhouse" || sourceById(id)?.driver === "jdbc") return false;
   try {
     await call(commands.dbFinishTransaction(id, commit));
     log("statement", commit ? "commit" : "rollback", `${promptOf(id)}>`);
@@ -1413,7 +1561,7 @@ async function askEndTransaction(source: DataSource): Promise<boolean | null> {
  * whether to commit or roll them back.
  */
 export async function setManualCommit(id: string, manual: boolean): Promise<void> {
-  if (sourceById(id)?.driver === "clickhouse" && manual) return;
+  if (sourceById(id)?.driver === "jdbc" || (sourceById(id)?.driver === "clickhouse" && manual)) return;
   const st = useDatabase.getState();
   if (manual === st.manualCommit.has(id)) return;
   if (!manual && st.pendingTx.has(id)) {
@@ -1446,6 +1594,12 @@ export function closeResult(id: number) {
       activeResult: s.activeResult === id ? ((results[index - 1] ?? results[index])?.id ?? OUTPUT_TAB) : s.activeResult,
     };
   });
+}
+
+/** Closes in-editor results `ids`. */
+export function closeInlineResults(ids: readonly number[]) {
+  if (!ids.length) return;
+  useDatabase.setState((s) => ({ inline: s.inline.filter((r) => !ids.includes(r.id)) }));
 }
 
 export function pinResult(id: number, pinned: boolean) {

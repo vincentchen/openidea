@@ -153,6 +153,22 @@ pub struct StatusItem {
     pub command: Option<String>,
 }
 
+/// What [`crate::host::read_clipboard`] found (API 1.11): `None` for a kind the clipboard
+/// doesn't hold.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClipboardContent {
+    pub text: Option<String>,
+    /// An image (a screenshot), always as PNG bytes.
+    pub image: Option<Vec<u8>>,
+}
+
+impl ClipboardContent {
+    /// The clipboard holds neither text nor an image.
+    pub fn is_empty(&self) -> bool {
+        self.text.is_none() && self.image.is_none()
+    }
+}
+
 /// An entry of [`crate::host::pick`] and [`crate::host::pick_many`].
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PickItem {
@@ -169,6 +185,71 @@ impl PickItem {
 
     pub fn description(mut self, description: &str) -> Self {
         self.description = Some(description.to_owned());
+        self
+    }
+}
+
+/// A highlight rule for Run and Debug console output ([`crate::host::set_console_rules`], API 1.12).
+///
+/// `pattern` is a regular expression in the syntax Rust's `regex` and JavaScript share, without
+/// inline flags, named groups, lookaround, backreferences or repeated groups; one that could
+/// backtrack for long on a 2000-character line is `Invalid`. Colours are console palette names
+/// (`red`, `bright-blue`, …), styles any of `bold`, `italic`, `underline`, `strikethrough`, `dim`;
+/// unknown names are ignored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ConsoleRule {
+    pub pattern: String,
+    pub ignore_case: bool,
+    pub foreground: Option<String>,
+    pub background: Option<String>,
+    pub styles: Vec<String>,
+    /// Style the whole line instead of only the matched text.
+    pub whole_line: bool,
+    /// A disabled rule keeps its place but never matches.
+    pub enabled: bool,
+}
+
+impl ConsoleRule {
+    /// An enabled, case-sensitive rule that styles only the matched text.
+    pub fn new(pattern: &str) -> Self {
+        Self {
+            pattern: pattern.to_owned(),
+            ignore_case: false,
+            foreground: None,
+            background: None,
+            styles: Vec::new(),
+            whole_line: false,
+            enabled: true,
+        }
+    }
+
+    pub fn ignore_case(mut self) -> Self {
+        self.ignore_case = true;
+        self
+    }
+
+    pub fn foreground(mut self, color: &str) -> Self {
+        self.foreground = Some(color.to_owned());
+        self
+    }
+
+    pub fn background(mut self, color: &str) -> Self {
+        self.background = Some(color.to_owned());
+        self
+    }
+
+    pub fn style(mut self, style: &str) -> Self {
+        self.styles.push(style.to_owned());
+        self
+    }
+
+    pub fn whole_line(mut self) -> Self {
+        self.whole_line = true;
+        self
+    }
+
+    pub fn enabled(mut self, enabled: bool) -> Self {
+        self.enabled = enabled;
         self
     }
 }
@@ -286,7 +367,13 @@ pub struct DocumentTextChange {
 #[derive(Clone, Debug, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DocumentChanged {
+    /// Relative to `project`.
     pub path: String,
+    /// Root of the open project `path` is relative to (absolute). Two open projects can
+    /// hold the same relative path; pass this project to `document-at`. `None` from
+    /// older IDEs.
+    #[serde(default)]
+    pub project: Option<String>,
     pub base_version: u64,
     pub version: u64,
     pub changes: Vec<DocumentTextChange>,
@@ -580,13 +667,19 @@ mod tests {
             "document-changed".into(),
             r#"{"path":"/p/a.rs","baseVersion":7,"version":8,"changes":[{"from":1,"to":2,"insert":"x"}]}"#.into(),
         );
-        assert!(matches!(change, Event::DocumentChanged(DocumentChanged { base_version: 7, .. })));
+        assert!(matches!(change, Event::DocumentChanged(DocumentChanged { base_version: 7, project: None, .. })));
+        let change = Event::from_other(
+            "document-changed".into(),
+            r#"{"path":"a.rs","project":"/p","baseVersion":7,"version":8,"changes":[]}"#.into(),
+        );
+        assert!(matches!(change, Event::DocumentChanged(DocumentChanged { project: Some(ref p), .. }) if p == "/p"));
         let ready = Event::from_other("websocket-ready".into(), r#"{"pluginId":"collab","connection":42}"#.into());
         assert_eq!(ready, Event::WebSocketReady(WebSocketReady { plugin_id: "collab".into(), connection: 42 }));
 
         let document = Document { version: 7, text: "a😀b".into() };
         let change = DocumentChanged {
             path: "/p/a.rs".into(),
+            project: None,
             base_version: 7,
             version: 8,
             changes: vec![DocumentTextChange { from: 1, to: 3, insert: "x".into() }],
@@ -711,6 +804,39 @@ pub struct BlameLine {
     pub author: String,
     pub date: i64,
     pub summary: String,
+}
+
+/// How an occurrence in a build's dependency graph was resolved (API 1.10).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DependencyStatus {
+    /// Part of the resolved graph.
+    Resolved,
+    /// Another version won: `version` is the winner, `requested_version` what this occurrence asked for.
+    OmittedForConflict,
+    /// Listed with its dependencies elsewhere in the graph; its children are not repeated.
+    OmittedForDuplicate,
+    /// Dependency management (a BOM, a platform, a constraint) supplies the version.
+    VersionManaged,
+}
+
+/// One occurrence in a build's flat dependency graph ([`crate::Project::build_dependencies`]).
+/// Each module is a root (`parent` is `None`, `scope` is empty) with its direct
+/// dependencies under it; walk `parent` up to see why an artifact is there.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DependencyNode {
+    /// Empty for a Gradle project of the build.
+    pub group: String,
+    /// Artifact id, or a Gradle project's path (`:core`).
+    pub artifact: String,
+    /// The version in use; empty for a Gradle project of the build or one Gradle could not resolve.
+    pub version: String,
+    /// Maven scope, or the Gradle configuration (`runtimeClasspath`).
+    pub scope: String,
+    pub status: DependencyStatus,
+    /// What this occurrence asked for, when it differs from `version`.
+    pub requested_version: Option<String>,
+    /// Index of the occurrence bringing this one in.
+    pub parent: Option<u32>,
 }
 
 /// Non-secret settings of a plugin-owned project database source (API 1.4).

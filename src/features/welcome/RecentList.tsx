@@ -50,12 +50,21 @@ export async function askRemoveRecent(project: RecentProject, before?: () => voi
 }
 
 /** Rounded-square project avatar; same colour slot and initials as the title bar's project widget. */
-export function ProjectBadge({ name, className }: { name: string; className?: string }) {
+export function ProjectBadge({ name, className, missing }: { name: string; className?: string; missing?: boolean }) {
   return (
-    <span className={clsx(styles.tile, className)} style={projectColorVars(name)} aria-hidden>
+    <span
+      className={clsx(styles.tile, missing && styles.tileMissing, className)}
+      style={projectColorVars(name)}
+      aria-hidden
+    >
       {projectInitials(name)}
     </span>
   );
+}
+
+/** The tooltip of a recent project whose folder is gone. */
+export function unavailableTitle(project: Pick<RecentProject, "path" | "missing">): string | undefined {
+  return project.missing ? tx`${project.path} (unavailable)` : undefined;
 }
 
 /** New Project Group…: asks for a name; with `path`, that project moves into the new group. */
@@ -188,12 +197,12 @@ function RecentRow({
   const opening = useRecent((s) => s.opening === m.project.path);
   const when = relativeTime(m.project.openedAtMs);
   return (
-    <div className={clsx(styles.recent, compact && styles.recentCompact)}>
-      <ProjectBadge name={m.project.name} />
+    <div className={styles.recent} title={unavailableTitle(m.project)}>
+      <ProjectBadge name={m.project.name} missing={!!m.project.missing} />
       <span className={styles.recentText}>
         <span className={styles.recentTop}>
           <HighlightedText
-            className={styles.recentName}
+            className={clsx(styles.recentName, m.project.missing && styles.unavailable)}
             text={m.project.name}
             indices={m.nameMatch}
             tone={active ? "accent" : "strong"}
@@ -265,7 +274,11 @@ export function RecentList({ exclude, compact, autoFocus, onOpened, className, t
       open(items[current]);
       return;
     }
-    if ((e.key === "Delete" || (e.key === "Backspace" && e.metaKey)) && items[current]) {
+    // Delete removes the selected project only when it has no text to delete: the caret is at the end
+    // of the query (⌘⌫: the query is empty). Otherwise it edits the query.
+    const field = e.currentTarget;
+    const atEnd = field.selectionStart === field.value.length && field.selectionEnd === field.value.length;
+    if (((e.key === "Delete" && atEnd) || (e.key === "Backspace" && e.metaKey && !field.value)) && items[current]) {
       e.preventDefault();
       void askRemoveRecent(items[current]!.project);
       return;

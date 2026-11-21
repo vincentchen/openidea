@@ -16,14 +16,16 @@ import {
   type ExternalToolValid,
 } from "@/platform/workflowSettings";
 import { Button, Checkbox, IconButton, Input, Menu, type SelectOption, T } from "@/ui";
-import { NumberInput, Row, SearchLabel, Section, Select } from "../components/Form";
+import { NumberInput, Row, SearchLabel, Section, Select, SettingSelect } from "../components/Form";
 import { useLabelMatch, useSetting } from "../components/context";
 import { selectPage, setQuery } from "../model/staging";
+import { MirrorPrefixRow } from "./DownloadSources";
 import { MCP_SERVER_PAGE } from "./mcpServer";
 import type { PageSpec } from "./spec";
 import { BoundToggle, Grid, Indented, PageLink, TableEditor } from "./workflowControls";
 import styles from "./Workflow.module.css";
 import { tx } from "@/platform/i18n";
+import { TERMINAL_MAX_FPS_OPTIONS } from "@/platform/workflowSettings";
 
 export const TOOLS_GROUP = "Tools";
 
@@ -244,6 +246,12 @@ function TerminalOptions() {
           <BoundToggle k="terminal.highlightHyperlinks" label="Highlight hyperlinks" />
           <BoundToggle k="terminal.highlightSelection" label="Highlight occurrences of selected text" />
           {isMac && <BoundToggle k="terminal.optionAsMeta" label="Use Option as Meta key" />}
+          <SettingSelect
+            k="terminal.maxFps"
+            label="Maximum refresh rate"
+            hint="Caps how often fast terminal output is painted. Hidden windows always paint more slowly."
+            options={TERMINAL_MAX_FPS_OPTIONS}
+          />
         </>
       }
     />
@@ -259,7 +267,8 @@ function TerminalFont() {
   const [columnWidth, setColumnWidth] = useSetting<number>("terminal.columnWidth");
   const matched = useLabelMatch("Use editor font");
   const monoMatched = useLabelMatch("Show only monospaced fonts");
-  const [monoOnly, setMonoOnly] = useState(true);
+  const [monoSetting, setMonoOnly] = useSetting<boolean>("editor.onlyMonospacedFonts");
+  const monoOnly = monoSetting !== false;
   return (
     <>
       <div className={clsx(styles.inlineRow, matched && styles.matched)}>
@@ -606,6 +615,7 @@ export const TOOLS_PAGES: PageSpec[] = [
               "Use Option as Meta key",
               "Move focus to the Editor with Escape",
               "Configure terminal keybindings",
+              "Maximum refresh rate",
             ],
             component: TerminalOptions,
           },
@@ -653,6 +663,33 @@ export const TOOLS_PAGES: PageSpec[] = [
     ],
   },
   {
+    id: "tools.externalDiff",
+    title: "External Diff Tools",
+    group: TOOLS_GROUP,
+    order: 605,
+    keywords: ["diff", "compare", "Beyond Compare", "meld", "kdiff3", "opendiff", "FileMerge"],
+    sections: [
+      {
+        options: [
+          {
+            kind: "toggle",
+            key: "externalDiff.enabled",
+            label: "Use external diff tool",
+            hint: "Diff viewers offer Show Diff in External Tool.",
+          },
+          { kind: "text", key: "externalDiff.path", label: "Path to executable", placeholder: "/usr/local/bin/bcomp" },
+          {
+            kind: "text",
+            key: "externalDiff.parameters",
+            label: "Parameters",
+            placeholder: "%1 %2 %3",
+            hint: "%1 – the left file, %2 – the right file, %3 – the diff's title.",
+          },
+        ],
+      },
+    ],
+  },
+  {
     id: "agents.chat",
     title: "Chat",
     group: "Agents",
@@ -672,6 +709,7 @@ export const TOOLS_PAGES: PageSpec[] = [
       "approval",
       "permission",
       "bypass",
+      "width",
     ],
     sections: [
       {
@@ -727,6 +765,11 @@ export const TOOLS_PAGES: PageSpec[] = [
             label: "Reveal streaming text smoothly",
             hint: "Text appears at a steady pace instead of in bursts",
           },
+          {
+            kind: "toggle",
+            key: "agents.fitWindowWidth",
+            label: "Fit conversation to the window width",
+          },
         ],
       },
       {
@@ -776,4 +819,24 @@ export const TOOLS_PAGES: PageSpec[] = [
     ],
   },
   MCP_SERVER_PAGE,
+  {
+    id: "tools.downloadSources",
+    title: "Download Mirrors",
+    group: TOOLS_GROUP,
+    order: 590,
+    keywords: ["mirror", "download", "github", "proxy", "slow", "language server", "accelerate"],
+    sections: [
+      {
+        title: "GitHub",
+        options: [
+          {
+            kind: "custom",
+            label: "Mirror prefix for GitHub downloads",
+            keywords: ["https://gh-proxy.com/", "info"],
+            component: MirrorPrefixRow,
+          },
+        ],
+      },
+    ],
+  },
 ];

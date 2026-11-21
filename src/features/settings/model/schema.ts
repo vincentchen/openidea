@@ -4,6 +4,8 @@
  * so `validateSettings` never throws — anything unknown or malformed falls
  * back to the default (mirrors `ide-core::settings` defaults).
  */
+import { DEFAULT_FILE_COLORS, validateFileColors, type FileColorSettings } from "@/platform/fileColors";
+import { validateScopes, type NamedScope } from "@/platform/scopes";
 import { validateCMake } from "@/platform/cmakeSettings";
 import { SUPPORTED_LOCALES, type Locale } from "@/platform/i18n";
 import { DEFAULT_IGNORED_NAMES } from "@/platform/ignoredNames";
@@ -39,6 +41,7 @@ import {
   type NotificationsValid,
 } from "./behaviorSchema";
 import { isThemeChoiceId, type ThemeChoiceId } from "@/platform/themes";
+import { PLAYFUL_AFTER_LIMITS } from "@/platform/agentStatus";
 
 /** Agents › IDE MCP Server › Port: its default (`ide-core::settings::DEFAULT_MCP_PORT`) and range. */
 export const DEFAULT_MCP_PORT = 26371;
@@ -58,6 +61,10 @@ export interface CustomKeymapSettings {
 
 export interface ValidSettings extends WorkflowSettings {
   plugins: Record<string, Record<string, unknown>>;
+  scopes: NamedScope[];
+  fileColors: FileColorSettings;
+  /** Database › Query Execution. */
+  database: { inEditorResults: boolean; resolutionScopes: Array<{ path: string; dataSource: string; schema: string }> };
   general: {
     reopenLastProject: boolean;
     confirmExit: boolean;
@@ -105,6 +112,8 @@ export interface ValidSettings extends WorkflowSettings {
   notifications: NotificationsValid;
   /** System Settings › HTTP Proxy (global). */
   proxy: ProxySettingsValid;
+  /** Tools › Download sources: a mirror prefix for the installer's release downloads. */
+  toolDownloads: { githubMirror: string };
   languages: LanguagesValid;
   cmake: ReturnType<typeof validateCMake>;
   projectStructure: ProjectStructureValid;
@@ -158,6 +167,9 @@ export { ACCENT_PRESETS } from "@/workbench/theme";
 
 export const DEFAULT_SETTINGS: ValidSettings = {
   plugins: {},
+  scopes: [],
+  fileColors: DEFAULT_FILE_COLORS,
+  database: { inEditorResults: false, resolutionScopes: [] },
   general: {
     reopenLastProject: true,
     confirmExit: true,
@@ -198,6 +210,7 @@ export const DEFAULT_SETTINGS: ValidSettings = {
   customKeymaps: {},
   notifications: DEFAULT_NOTIFICATIONS,
   proxy: DEFAULT_PROXY,
+  toolDownloads: { githubMirror: "" },
   languages: DEFAULT_LANGUAGES,
   cmake: {},
   projectStructure: DEFAULT_PROJECT_STRUCTURE,
@@ -212,6 +225,10 @@ export const DEFAULT_SETTINGS: ValidSettings = {
     showCost: false,
     foldTurns: true,
     smoothText: true,
+    fitWindowWidth: false,
+    playfulStatus: false,
+    playfulAfterSeconds: 0,
+    playfulWords: {},
     thinking: "auto",
     toolCalls: "grouped",
     expandToolOutput: false,
@@ -256,6 +273,15 @@ const stringMap = (v: unknown): Record<string, string> =>
 /** Agent id → option id → value, keeping only string values. */
 function agentDefaults(v: unknown): Record<string, Record<string, string>> {
   return Object.fromEntries(Object.entries(obj(v)).map(([agent, options]) => [agent, stringMap(options)]));
+}
+
+/** Activity → the user's playful words; a list, even an empty one, stands for that activity. */
+function playfulWords(v: unknown): Record<string, string[]> {
+  return Object.fromEntries(
+    Object.entries(obj(v))
+      .filter(([, words]) => Array.isArray(words))
+      .map(([activity, words]) => [activity, stringList(words)]),
+  );
 }
 
 function agentMcpServers(v: unknown): Required<AgentSettings>["mcpServers"] {
@@ -318,6 +344,19 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
   }
   return {
     plugins: Object.fromEntries(Object.entries(obj(root.plugins)).map(([id, values]) => [id, obj(values)])),
+    scopes: validateScopes(root.scopes),
+    fileColors: validateFileColors(root.fileColors),
+    database: {
+      inEditorResults: bool(obj(root.database).inEditorResults, d.database.inEditorResults),
+      resolutionScopes: (Array.isArray(obj(root.database).resolutionScopes)
+        ? (obj(root.database).resolutionScopes as unknown[])
+        : []
+      ).map((r) => ({
+        path: str(obj(r).path, ""),
+        dataSource: str(obj(r).dataSource, ""),
+        schema: str(obj(r).schema, ""),
+      })),
+    },
     general: {
       ...validateGeneralExtras(g),
       reopenLastProject: bool(g.reopenLastProject, d.general.reopenLastProject),
@@ -370,6 +409,12 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
     customKeymaps,
     notifications: validateNotifications(root.notifications),
     proxy: validateProxy(root.proxy),
+    toolDownloads: {
+      githubMirror:
+        typeof obj(root.toolDownloads).githubMirror === "string"
+          ? String(obj(root.toolDownloads).githubMirror).trim()
+          : "",
+    },
     languages: validateLanguages(root.languages),
     cmake: validateCMake(root.cmake),
     projectStructure: validateProjectStructure(root.projectStructure),
@@ -391,6 +436,10 @@ export function validateSettings(raw: Settings | unknown): ValidSettings {
       showCost: bool(agents.showCost, d.agents.showCost),
       foldTurns: bool(agents.foldTurns, d.agents.foldTurns),
       smoothText: bool(agents.smoothText, d.agents.smoothText),
+      fitWindowWidth: bool(agents.fitWindowWidth, d.agents.fitWindowWidth),
+      playfulStatus: bool(agents.playfulStatus, d.agents.playfulStatus),
+      playfulAfterSeconds: num(agents.playfulAfterSeconds, d.agents.playfulAfterSeconds, PLAYFUL_AFTER_LIMITS, true),
+      playfulWords: playfulWords(agents.playfulWords),
       thinking: oneOf(agents.thinking, ["auto", "expanded", "collapsed"] as const, d.agents.thinking),
       toolCalls: oneOf(agents.toolCalls, ["grouped", "each"] as const, d.agents.toolCalls),
       expandToolOutput: bool(agents.expandToolOutput, d.agents.expandToolOutput),

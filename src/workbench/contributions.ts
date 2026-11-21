@@ -17,8 +17,18 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
-import type { CommitSelection, FileMatches, SearchQuery, RunConfig, RunId } from "@/bindings";
+import type {
+  CommitSelection,
+  ConsoleRule,
+  FileMatches,
+  Location,
+  SearchQuery,
+  RunConfig,
+  RunId,
+  SymbolKind,
+} from "@/bindings";
 import { notifyEach } from "@/platform/listeners";
+import type { ProjectType } from "@/ui/projectType";
 import type { MenuItem } from "@/ui/Menu";
 import type { DragData } from "@/ui/pointerDrag";
 import type { TreeReorder } from "@/ui/Tree";
@@ -142,6 +152,10 @@ export interface EditorKindContribution {
   keepAlive?: boolean;
   /** Last tab showing this input closed (including split tabs and tab-limit eviction). */
   onClose?(input: EditorInput): void;
+  /** The input that shows this tab where it is now when Back returns to it, e.g. a diff at its caret. */
+  navigationInput?(input: EditorInput): EditorInput;
+  /** Any tab of this kind closed (`tabId` is the closed `Tab.id`, even when split siblings remain). */
+  onTabClose?(tabId: string, input: EditorInput): void;
   /**
    * Whether the tab is busy (a process is running, like a terminal session's):
    * closing its last tab asks first, and tab-limit eviction skips it. May be
@@ -372,6 +386,11 @@ export const EditorShownProvider = EditorShown.Provider;
 /** Whether this editor tab is the one its pane shows (a `keepAlive` tab stays mounted when it isn't). */
 export const useEditorShown = () => useContext(EditorShown);
 
+const EditorTabId = createContext<string | null>(null);
+export const EditorTabIdProvider = EditorTabId.Provider;
+/** Unique `Tab.id` of the enclosing custom editor tab, or `null` outside an editor pane. */
+export const useEditorTabId = () => useContext(EditorTabId);
+
 const ToolWindowShown = createContext(true);
 export const ToolWindowShownProvider = ToolWindowShown.Provider;
 /** Whether this tool window is showing (one shown once stays mounted while hidden). */
@@ -530,6 +549,8 @@ export interface ExternalFileOpenHandler {
   id: string;
   /** Lower asks first. Default 100. */
   order?: number;
+  /** Whether `path` goes to another application. */
+  matches(path: string): boolean;
   /** Opens `path` outside the IDE; true when it was handed over. */
   open(path: string): boolean | Promise<boolean>;
 }
@@ -543,6 +564,11 @@ export function registerExternalFileOpenHandler(handler: ExternalFileOpenHandler
   };
 }
 
+/** Whether opening `path` would hand it to another application. */
+export function opensExternally(path: string): boolean {
+  return [...externalFileOpenHandlers.values()].some((h) => h.matches(path));
+}
+
 /** Opens `path` with another application; false when no handler took it. Handler failures fall through. */
 export async function openFileExternally(path: string): Promise<boolean> {
   const handlers = [...externalFileOpenHandlers.values()].sort(
@@ -550,7 +576,7 @@ export async function openFileExternally(path: string): Promise<boolean> {
   );
   for (const handler of handlers) {
     try {
-      if (await handler.open(path)) return true;
+      if (handler.matches(path) && (await handler.open(path))) return true;
     } catch (e) {
       console.warn(`external file opener ${handler.id} failed`, e);
     }
@@ -596,6 +622,34 @@ export function textEditorWrapperFor(
 }
 
 /**
+ * Panels at the right edge of every editor group (a plugin's minimap). Each group mounts one
+ * instance and keeps it while it switches tabs (a frame inside would reload if it moved);
+ * `tabId` is the group's text editor tab, or null while it shows anything else (the panel is
+ * hidden then, still mounted).
+ */
+export interface EditorGroupPanelContribution {
+  id: string;
+  /** Pixels. */
+  width: number;
+  component: ComponentType<{ paneId: string; tabId: string | null }>;
+}
+
+export const useEditorGroupPanels = create<{ panels: Map<string, EditorGroupPanelContribution> }>(() => ({
+  panels: new Map(),
+}));
+
+export function registerEditorGroupPanel(p: EditorGroupPanelContribution): () => void {
+  useEditorGroupPanels.setState((s) => ({ panels: new Map(s.panels).set(p.id, p) }));
+  return () =>
+    useEditorGroupPanels.setState((s) => {
+      if (s.panels.get(p.id) !== p) return s;
+      const panels = new Map(s.panels);
+      panels.delete(p.id);
+      return { panels };
+    });
+}
+
+/**
  * Spread on an element that handles files dropped from the OS itself (copy into
  * a folder, attach to a prompt); the window-wide drop (open in the editor)
  * leaves drops over it alone.
@@ -618,6 +672,8 @@ export interface OpenOptions {
   focus?: boolean;
   /** Open in the text editor even when a file editor provider claims the file (SVG as text). */
   asText?: boolean;
+  /** False: leave files that go to another application unopened (autoscroll must not launch apps). */
+  external?: boolean;
 }
 
 export interface OpenEditorTab {
@@ -634,12 +690,16 @@ export const EDITOR_TAB_MIME = "application/x-openidea-editor-tab";
 export interface EditorService {
   openFile(path: string, options?: OpenOptions): Promise<void>;
   openInput(input: EditorInput, options?: OpenOptions): Promise<void>;
+  /** File › New File: an editable untitled buffer; Save asks for a path. */
+  openUntitled?(options?: OpenOptions): Promise<void>;
   /** Path of the focused text editor, if any. */
   activePath(): string | null;
   /** Doc id + cursor of the focused text editor. */
   activeCursor(): { doc: number; path: string; line: number; col: number; offset: number } | null;
   /** Save all dirty documents; rejects with the failures once every save was tried. */
-  saveAll(): Promise<void>;
+  saveAll(opts?: { skipUntitled?: boolean }): Promise<void>;
+  /** Doc ids of untitled buffers with unsaved changes (they follow the window, not a project). */
+  untitledDirtyDocumentIds?(): number[];
   /** Includes local edits not yet acknowledged by the backend. */
   dirtyDocumentIds?(): number[];
   /** Move keyboard focus to the active editor (used by Escape from tool windows). */
@@ -677,6 +737,15 @@ export interface EditorService {
   keepSavedTabs?(): void;
   /** Edit › Undo / Redo for a focused custom editor that has its own history; false when none takes it. */
   documentHistory?(command: "undo" | "redo"): boolean;
+  /** Go to Declaration's chooser ("Choose Declaration of `name`") over `targets`, below `anchor`. */
+  chooseDeclaration?(targets: DeclarationChoice[], name: string, anchor: { x: number; y: number }): Promise<void>;
+}
+
+/** A target of {@link EditorService.chooseDeclaration}: an index symbol's place, name and container. */
+export interface DeclarationChoice extends Location {
+  name: string;
+  kind: SymbolKind;
+  container: string | null;
 }
 
 /** Custom editor documents held still for a window / project close decision. */
@@ -693,7 +762,11 @@ export interface EditorCloseSession {
 
 export interface ToolWindowService {
   show(id: string, focus?: boolean): void;
-  hide(id: string): void;
+  /**
+   * `removeFromStripe`: a window whose content is its tabs (Find, Run, Hierarchy…) lost its last
+   * one: its stripe button goes too, until new content opens it again (IDEA).
+   */
+  hide(id: string, options?: { removeFromStripe?: boolean }): void;
   toggle(id: string): void;
   isVisible(id: string): boolean;
 }
@@ -712,7 +785,7 @@ export interface NotificationService {
     verbatim?: boolean;
     /**
      * Notification group (Settings › Notifications): `system` (default), `lsp`,
-     * `vcs`, `run`, `tools`, `plugins`, `search`, `updates`.
+     * `vcs`, `run`, `tools`, `plugins`, `search`, `terminal`, `updates`.
      */
     group?: string;
     /**
@@ -722,6 +795,8 @@ export interface NotificationService {
      * silence what the IDE reports on its own, not the answer to a request.
      */
     userInitiated?: boolean;
+    /** Skip the chime even when "Play sound" is on (e.g. native OS sound already played). */
+    silent?: boolean;
   }): void;
   /** Hides the balloon of the notification with `key` (it stays in the log), e.g. once its cause is gone. */
   expire?(key: string): void;
@@ -770,6 +845,7 @@ const services: {
   notifications?: NotificationService;
   embeddedTerminal?: EmbeddedTerminalFactory;
   runOutput?: RunOutputService;
+  hasRunConfiguration?: (kind: string, directory: string) => boolean;
 } = {};
 
 function need<T>(s: T | undefined, name: string): T {
@@ -782,6 +858,10 @@ export const provideToolWindowService = (s: ToolWindowService) => void (services
 export const provideNotificationService = (s: NotificationService) => void (services.notifications = s);
 export const provideEmbeddedTerminal = (f: EmbeddedTerminalFactory | undefined) => void (services.embeddedTerminal = f);
 export const provideRunOutput = (s: RunOutputService | undefined) => void (services.runOutput = s);
+export const provideRunConfigurationLookup = (lookup: typeof services.hasRunConfiguration) =>
+  void (services.hasRunConfiguration = lookup);
+export const hasRunConfiguration = (kind: string, directory: string): boolean =>
+  services.hasRunConfiguration?.(kind, directory) ?? false;
 
 export const editorService = (): EditorService => need(services.editor, "editor");
 export const toolWindowService = (): ToolWindowService => need(services.toolWindows, "toolWindows");
@@ -804,8 +884,24 @@ export interface CommitService {
    * Commit does); `null` without a repository.
    */
   selection(): Promise<CommitSelection | null>;
+  /**
+   * The included changes as a unified diff against HEAD (unsaved editors saved first);
+   * `null` without a repository.
+   */
+  changes(): Promise<CommitChanges | null>;
+  /** The draft's current revision: bumped whenever the message, Amend or the inclusion changes. */
+  revision(): number;
   /** Replaces the message if the draft is still at `revision`; false when it changed. */
   setMessage(revision: number, message: string): boolean;
+}
+
+export interface CommitChanges {
+  /** The draft's revision the diff was read at, for `CommitService.setMessage`. */
+  revision: number;
+  /** Repositories the commit goes to. */
+  roots: string[];
+  /** Untracked files included; empty when nothing is included. */
+  patch: string;
 }
 
 let commitServiceImpl: CommitService | undefined;
@@ -922,6 +1018,24 @@ export function provideFindResults(opener: (source: FindResultsSource) => void):
 
 export function showFindResults(source: FindResultsSource) {
   findResultsOpener?.(source);
+}
+
+// ---------------------------------------------------------------------------
+// Console highlight rules: plugins supply them, the Run and Debug consoles apply
+// them to process output (`ui/consoleRules`).
+
+export const useConsoleRules = create<{ providers: ReadonlyMap<string, readonly ConsoleRule[]> }>(() => ({
+  providers: new Map(),
+}));
+
+/** Replaces the rules of one provider (a plugin id); an empty list removes them. */
+export function setConsoleRules(provider: string, rules: readonly ConsoleRule[]) {
+  useConsoleRules.setState((s) => {
+    const providers = new Map(s.providers);
+    if (rules.length) providers.set(provider, rules);
+    else if (!providers.delete(provider)) return s;
+    return { providers };
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -1048,6 +1162,10 @@ export interface SettingsPageContribution {
   component?: ComponentType;
   /** The page edits settings that a project can override (Global / This project switch). */
   projectScope?: boolean;
+  /** The page fills the area under the header edge to edge, without the usual padding. */
+  bleed?: boolean;
+  /** The scope the switch starts on (default: global). */
+  defaultScope?: "global" | "project";
 }
 
 /**
@@ -1077,6 +1195,28 @@ export interface SettingsForm {
   };
 }
 
+/** What the settings page being shown was opened to select (`page#focus`), and how it takes it. */
+export interface SettingsPageFocus {
+  focus: string | null;
+  /** Clears `focus`, so showing the page again does not select it again. */
+  consume(): void;
+}
+
+export const SettingsPageFocusContext = createContext<SettingsPageFocus>({ focus: null, consume: () => {} });
+
+/** The `page#focus` target of the settings page being shown (provided by the Settings dialog). */
+export function useSettingsPageFocus(): SettingsPageFocus {
+  return useContext(SettingsPageFocusContext);
+}
+
+/** Where a settings page may portal controls into the page header, beside its title. */
+export const SettingsHeaderSlotContext = createContext<HTMLElement | null>(null);
+
+/** The header slot of the settings page being shown; null outside the Settings dialog. */
+export function useSettingsHeaderSlot(): HTMLElement | null {
+  return useContext(SettingsHeaderSlotContext);
+}
+
 export const SettingsFormContext = createContext<SettingsForm | null>(null);
 
 /** The form of the settings page being shown (provided by the Settings dialog). */
@@ -1096,6 +1236,28 @@ export function registerSettingsPage(page: SettingsPageContribution): () => void
       const pages = new Map(s.pages);
       pages.delete(page.id);
       return { pages };
+    });
+}
+
+/** Registers a batch of settings pages in one store update; returns a batched disposer. */
+export function registerSettingsPages(list: SettingsPageContribution[]): () => void {
+  if (!list.length) return () => {};
+  const owned = new Map<string, SettingsPageContribution>();
+  for (const page of list) owned.set(page.id, page);
+  useSettingsPages.setState((s) => {
+    const pages = new Map(s.pages);
+    for (const [id, page] of owned) pages.set(id, page);
+    return { pages };
+  });
+  return () =>
+    useSettingsPages.setState((s) => {
+      let next: Map<string, SettingsPageContribution> | null = null;
+      for (const [id, page] of owned) {
+        if (s.pages.get(id) !== page) continue;
+        next ??= new Map(s.pages);
+        next.delete(id);
+      }
+      return next ? { pages: next } : s;
     });
 }
 
@@ -1181,18 +1343,22 @@ export function projectViewRoots(map: ReadonlyMap<string, ProjectViewRootContrib
 // `selectIn` is the Select In chooser (⌥F1): targets for a file besides the project view.
 // `new` is the New popup / New › submenu (IDEA's NewGroup): file kinds a feature creates
 // in `paths[0]`, the target directory (features/templates: file templates, http-client: HTTP Request).
+// `copyPath` is the Copy Path/Reference… chooser: more things to copy for a file (features/vcs: its
+// link on the Git remote), each item's `preview` the copied text.
 
 export type ContextMenuId =
   | "editor"
   | "projectView"
   | "editorTab"
+  | "changes"
   | "problems"
   | "searchResults"
   | "editorGutter"
   | "openIn"
   | "stopProcess"
   | "selectIn"
-  | "new";
+  | "new"
+  | "copyPath";
 
 /**
  * Entries of open menu slots: the native main menu's (src-tauri/src/menu.rs
@@ -1226,10 +1392,14 @@ export interface MenuGroupContext {
   paths: string[];
   /** Per path: whether it is a directory (project view). */
   dirs?: boolean[];
+  /** New menu: the detected type of the project owning the target directory. */
+  projectType?: ProjectType;
   /** The document text, when the menu is for an open document. */
   text?: string;
   /** Editor menu: 0-based caret line; gutter menu: the clicked line. */
   line?: number;
+  /** Copy Path/Reference… in the editor: the selection's last line, when it spans several. */
+  endLine?: number;
   /** Zero-based UTF-16 column for problem/search result commands. */
   column?: number;
   /** The tab's input, when the menu is for an editor tab without a path. */
@@ -1896,21 +2066,48 @@ export async function synchronizeDocumentIndexes(path: string, purpose: Document
   return complete.every((c) => c !== false);
 }
 
-/** Font zoom for non-CodeMirror surfaces, owned and released by their features. */
-const fontZoomSurfaces = new Map<Element, (delta: number) => void>();
+export interface FontZoomSurfaceOptions {
+  /** When true, `editor.resetFontSize` resets only this surface when focused, and leaves it untouched otherwise. */
+  isolated?: boolean;
+}
 
-export function registerFontZoomSurface(host: Element, step: (delta: number) => void): () => void {
-  fontZoomSurfaces.set(host, step);
+/** Font zoom for non-CodeMirror surfaces, owned and released by their features. */
+const fontZoomSurfaces = new Map<Element, { step: (delta: number) => void; isolated: boolean }>();
+
+export function registerFontZoomSurface(
+  host: Element,
+  step: (delta: number) => void,
+  options?: FontZoomSurfaceOptions,
+): () => void {
+  fontZoomSurfaces.set(host, { step, isolated: !!options?.isolated });
   return () => {
     fontZoomSurfaces.delete(host);
   };
 }
 
-export function stepFocusedSurfaceFontZoom(delta: number): boolean {
+export function stepFocusedSurfaceFontZoom(delta: number, options?: { isolatedOnly?: boolean }): boolean {
   const focused = document.activeElement;
-  for (const [host, step] of fontZoomSurfaces) {
-    if (focused && host.contains(focused)) {
-      step(delta);
+  if (!focused) return false;
+  for (const [host, entry] of fontZoomSurfaces) {
+    if (options?.isolatedOnly && !entry.isolated) continue;
+    if (host.contains(focused) || (focused.hasAttribute("data-editor-focus") && focused.contains(host))) {
+      entry.step(delta);
+      return true;
+    }
+  }
+  return false;
+}
+
+export function stepSurfaceFontZoomIn(
+  container: Element | null,
+  delta: number,
+  options?: { isolatedOnly?: boolean },
+): boolean {
+  if (!container) return false;
+  for (const [host, entry] of fontZoomSurfaces) {
+    if (options?.isolatedOnly && !entry.isolated) continue;
+    if (container.contains(host)) {
+      entry.step(delta);
       return true;
     }
   }
@@ -1918,7 +2115,9 @@ export function stepFocusedSurfaceFontZoom(delta: number): boolean {
 }
 
 export function resetSurfaceFontZoom(): void {
-  for (const step of fontZoomSurfaces.values()) step(0);
+  for (const entry of fontZoomSurfaces.values()) {
+    if (!entry.isolated) entry.step(0);
+  }
 }
 
 /** Optional plugin test parser; the Run feature keeps the existing test tree. */
@@ -1960,4 +2159,42 @@ export const useContributedSnippets = create<{ snippets: ContributedSnippet[] }>
 export function addContributedSnippets(snippets: ContributedSnippet[]): () => void {
   useContributedSnippets.setState((s) => ({ snippets: [...s.snippets, ...snippets] }));
   return () => useContributedSnippets.setState((s) => ({ snippets: s.snippets.filter((x) => !snippets.includes(x)) }));
+}
+
+// ---------------------------------------------------------------------------
+// Search Everywhere categories. Custom categories are opt-in tabs, never All sources.
+export type SearchCategoryId = `plugin:${string}:${string}`;
+export interface SearchCategory {
+  id: SearchCategoryId;
+  title: string;
+  search(
+    request: import("@/bindings").RequestId,
+    query: string,
+    limit: number,
+  ): Promise<import("@/bindings").PluginSearchPage>;
+  /** Resolve within this provider, rather than looking up an ambiguous global action id. */
+  command(id: string): import("@/platform/actions").Action | undefined;
+}
+const searchCategoryProviders = new Map<SearchCategoryId, SearchCategory>();
+const searchCategoryListeners = new Set<() => void>();
+export function searchCategories(): readonly SearchCategory[] {
+  return [...searchCategoryProviders.values()];
+}
+export function onSearchCategoriesChanged(listener: () => void): () => void {
+  searchCategoryListeners.add(listener);
+  return () => {
+    searchCategoryListeners.delete(listener);
+  };
+}
+function searchCategoriesChanged() {
+  notifyEach(searchCategoryListeners, (listener) => listener(), "search categories changed");
+}
+export function registerSearchCategory(category: SearchCategory): () => void {
+  searchCategoryProviders.set(category.id, category);
+  searchCategoriesChanged();
+  return () => {
+    if (searchCategoryProviders.get(category.id) !== category) return;
+    searchCategoryProviders.delete(category.id);
+    searchCategoriesChanged();
+  };
 }

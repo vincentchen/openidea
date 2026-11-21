@@ -102,6 +102,18 @@ describe("Welcome › Projects", () => {
     expect(screen.getByRole("button", { name: "Open" })).toBeTruthy();
   });
 
+  it("shows a project whose folder is gone as unavailable", async () => {
+    recent = [
+      p("acme-api", "/Users/me/repo/acme-api", "dev"),
+      { ...p("gone", "/Users/me/worktrees/gone"), missing: true },
+    ];
+    await renderWelcome();
+    const [live, gone] = screen.getAllByRole("option");
+    expect(live!.title).toBe("/Users/me/repo/acme-api");
+    expect(gone!.title).toBe("/Users/me/worktrees/gone (unavailable)");
+    expect(within(gone!).getByText("gone").className).toMatch(/unavailable/);
+  });
+
   it("moves with arrows, filters by typing, opens with Enter and removes with Delete", async () => {
     await renderWelcome();
     const search = screen.getByLabelText("Search projects") as HTMLInputElement;
@@ -123,6 +135,18 @@ describe("Welcome › Projects", () => {
     fireEvent.change(search, { target: { value: "py" } });
     expect(screen.getAllByRole("option")).toHaveLength(1);
     expect(selectedName()).toBe("py-demo");
+  });
+
+  it("leaves Delete to the search text while the caret has text after it", async () => {
+    await renderWelcome();
+    const search = screen.getByLabelText("Search projects") as HTMLInputElement;
+    fireEvent.change(search, { target: { value: "acme" } });
+    search.setSelectionRange(1, 1);
+    fireEvent.keyDown(search, { key: "Delete" });
+    expect(screen.queryByRole("dialog", { name: "Remove Recent Project" })).toBeNull();
+    search.setSelectionRange(4, 4);
+    fireEvent.keyDown(search, { key: "Delete" });
+    expect(screen.getByRole("dialog", { name: "Remove Recent Project" })).toBeTruthy();
   });
 
   it("offers Open in New Window in the row menu when the action exists", async () => {

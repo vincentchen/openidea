@@ -13,6 +13,7 @@ export {
   FILES_DRAG,
   REMOTE_FILES_DRAG,
   dragRequiresAlt,
+  beginDrag,
   dragSession,
   dropZoneAt,
   registerDropTarget,
@@ -35,7 +36,7 @@ export { fuzzyMatch, wordMatch } from "./match";
 export { badgeKind } from "./symbolKind";
 export { acquirePopup, isPopupOpen } from "./popupState";
 export * from "./BarButton";
-export { lazyComponent, lazyWhen, prefetchLazyComponents } from "./lazy";
+export { lazyComponent, lazyWhen, prefetchLazyComponents, type LazyComponent } from "./lazy";
 export { Given, T } from "./T";
 export { selectableText, copyMenuFor, copyText } from "./selectableText";
 export { selectReadingPane, useSelectionBoundary } from "./useSelectionBoundary";

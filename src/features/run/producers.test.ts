@@ -9,6 +9,7 @@ import {
   produceContextChoices,
   produceDirectory,
   produceFile,
+  produceFuzz,
   shebang,
   shellWord,
   fileTargets,
@@ -142,6 +143,18 @@ describe("single-file producers (scratches)", () => {
     expect(produceContext(input, { ...ALL, bun: true })!.config!.debugAdapter).toBe("bun-dap");
     // Not for scratches outside the project.
     expect(run(scratch("x.ts"), { ...ALL, deno: true })).toMatchObject({ command: "/bin/node" });
+  });
+
+  it("a preferred runtime runs scratches too, and a missing one is reported, not replaced", () => {
+    expect(run(scratch("x.ts"), { ...ALL, bun: true, preferred: true })).toMatchObject({
+      command: "/bin/bun",
+      args: ["run", "x.ts"],
+    });
+    const noBun = env({ node: "24.11.0" }, { bun: true, preferred: true });
+    expect(produceContext(scratch("x.ts"), noBun)!.missing!.body).toContain("Bun was not found");
+    // From project markers only, a missing runtime still falls back to Node.js.
+    const input: ContextInput = { path: `${ROOT}/scripts/x.js`, root: ROOT, configs: [] };
+    expect(run(input, env({ node: "24.11.0" }, { deno: true }))).toMatchObject({ command: "/bin/node" });
   });
 
   it("Python: the interpreter from settings, then the project's, then python3", () => {
@@ -411,7 +424,12 @@ describe("single-file producers (scratches)", () => {
     expect(main.debug!.build.command).toMatch(
       /^mkdir -p \/tmp\/openidea-run && \/bin\/zig build-exe calc\.zig -femit-bin=\/tmp\/openidea-run\/calc-\w+$/,
     );
-    expect(main.debug!.config).toMatchObject({ kind: "native", debugAdapter: "codelldb", args: [] });
+    expect(main.debug!.config).toMatchObject({
+      kind: "native",
+      debugAdapter: "codelldb",
+      args: [],
+      params: { language: "zig" },
+    });
 
     const test = produceContext(scratch("calc.zig", src, 3), e)!;
     expect(test).toMatchObject({ name: "adds two numbers", scope: "element" });
@@ -594,6 +612,26 @@ describe("single-file producers (scratches)", () => {
     expect(p.config!.args).toEqual(["-cp", "${classpath}", "com.example.ShopApplication"]);
   });
 
+  it("Java: a main in a Maven project linked from outside the project runs on its classpath (#4066)", () => {
+    const svc = "/work/billing";
+    const boot =
+      "package com.example;\n@SpringBootApplication\npublic class ShopApplication {\n" +
+      "  public static void main(String[] args) {}\n}";
+    const maven = [cfg({ id: `maven:test:${svc}`, kind: "maven", args: ["test"], cwd: svc, isTest: true })];
+    const p = produceContext(
+      {
+        path: `${svc}/src/main/java/com/example/ShopApplication.java`,
+        root: ROOT,
+        configs: maven,
+        content: boot,
+        line: 3,
+        contentRoots: [svc],
+      },
+      ALL,
+    )!;
+    expect(p.config).toMatchObject({ kind: "spring-boot", module: svc, cwd: null });
+  });
+
   it("Java: a class whose superclass declares main runs as a Spring Boot application", async () => {
     const path = `${ROOT}/src/main/java/demo/AiChatApplication.java`;
     const content = "package demo;\n\n@SpringBootApplication\npublic class AiChatApplication extends AtomStarter {}\n";
@@ -638,6 +676,12 @@ describe("single-file producers (scratches)", () => {
         kind: "gradle",
         dir: "services/api",
         file: "services/api/app/src/main/java/org/dromara/DromaraApplication.java",
+      },
+      // #4066: linked through Add Maven Projects, deeper than the folder search reaches.
+      {
+        kind: "maven",
+        dir: "site/service/03_src/demo-monitor",
+        file: "site/service/03_src/demo-monitor/src/main/java/org/dromara/DromaraApplication.java",
       },
     ] as const;
     for (const { kind, dir, file } of cases) {
@@ -730,6 +774,36 @@ describe("project producers", () => {
     expect(nested.config).toMatchObject({ args: ["--path", ".", "res://main.tscn"], cwd: "demo" });
     // Outside a Godot project there is nothing to run.
     expect(produceContext({ path: `${ROOT}/a.tscn`, root: ROOT, configs: [] }, OPTIMISTIC)).toBeNull();
+  });
+
+  it("Dart files of a Flutter app run as the app (flutter run -t) in the app's folder", () => {
+    const flutter = [
+      cfg({ id: "flutter:run", kind: "flutter", command: "flutter", args: ["run", "-t", "lib/main.dart"], cwd: "app" }),
+    ];
+    const p = produceContext({ path: `${ROOT}/app/lib/demo.dart`, root: ROOT, configs: flutter }, ALL)!;
+    expect(p).toMatchObject({ name: "demo.dart", scope: "file" });
+    expect(p.config).toMatchObject({
+      kind: "flutter",
+      command: "flutter",
+      args: ["run", "-t", "lib/demo.dart"],
+      cwd: "app",
+      debugAdapter: "dart",
+    });
+    // Its tests run with `flutter test`, a Dart package's with `dart test`.
+    expect(run({ path: `${ROOT}/app/test/widget_test.dart`, root: ROOT, configs: flutter })).toMatchObject({
+      command: "flutter",
+      args: ["test", "test/widget_test.dart"],
+      cwd: "app",
+    });
+    expect(run({ path: `${ROOT}/tool/test/gen_test.dart`, root: ROOT, configs: flutter })).toMatchObject({
+      command: "/bin/dart",
+      args: ["test", "tool/test/gen_test.dart"],
+    });
+    // Outside the app (a Dart package next to it): `dart run`.
+    expect(run({ path: `${ROOT}/tool/gen.dart`, root: ROOT, configs: flutter })).toMatchObject({
+      command: "/bin/dart",
+      args: ["run", "tool/gen.dart"],
+    });
   });
 
   it("keeps package.json test files on the project's runner", () => {
@@ -1122,6 +1196,57 @@ describe("Go test names (GoLand)", () => {
     )!;
     expect(p.name).toBe("TestAdd in example.com/api");
     expect(p.config!.args).toEqual(["test", ".", "-run", "^TestAdd$"]);
+  });
+});
+
+describe("Go Run with Fuzzing (GoLand)", () => {
+  const GO = [
+    cfg({ id: "go:test", kind: "go", command: "go", args: ["test", "./..."], isTest: true, debugAdapter: "delve" }),
+  ];
+  const src = [
+    "package parse", // 0
+    'import "testing"',
+    "func TestParse(t *testing.T) {}", // 2
+    "func BenchmarkParse(b *testing.B) {}",
+    "func ExampleParse() {}",
+    "func FuzzParse(f *testing.F) {", // 5
+    '\tf.Add("x")',
+    "\tf.Fuzz(func(t *testing.T, s string) {", // 7
+    "\t})",
+    "}",
+    "func helper() {}", // 10
+  ].join("\n");
+  const modules = (dir: string) => (dir === ROOT ? "example.com/fixture" : undefined);
+  const at = (line: number | undefined, path = `${ROOT}/internal/parse/parse_test.go`, content = src) =>
+    produceFuzz({ path, root: ROOT, configs: GO, content, line, goModule: modules }, ALL);
+
+  it("the Fuzz function at the caret, its body included, fuzzes its package", () => {
+    for (const line of [5, 7]) {
+      const p = at(line)!;
+      expect(p.name).toBe("FuzzParse in example.com/fixture/internal/parse");
+      expect(p.config).toMatchObject({
+        args: ["test", "./internal/parse", "-run", "^FuzzParse$", "-fuzz", "^FuzzParse$"],
+        name: "FuzzParse in example.com/fixture/internal/parse (fuzzing)",
+        isTest: true,
+      });
+    }
+    expect(at(5, `${ROOT}/parse_test.go`)!.config!.args).toEqual([
+      "test",
+      ".",
+      "-run",
+      "^FuzzParse$",
+      "-fuzz",
+      "^FuzzParse$",
+    ]);
+  });
+
+  it("nothing for tests, benchmarks, examples, other code or the file", () => {
+    for (const line of [0, 2, 3, 4, 10, undefined]) expect(at(line)).toBeNull();
+    // Not a test file: `go test` doesn't build its Fuzz functions as fuzz targets.
+    expect(at(5, `${ROOT}/internal/parse/parse.go`)).toBeNull();
+    // `Fuzzer` is not a fuzz target name; a Fuzz function needs a *testing.F.
+    const misnamed = "package p\nfunc Fuzzer(f *testing.F) {}\nfunc FuzzT(t *testing.T) {}";
+    for (const line of [1, 2]) expect(at(line, undefined, misnamed)).toBeNull();
   });
 });
 

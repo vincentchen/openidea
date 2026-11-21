@@ -70,6 +70,7 @@ pub fn sqlserver_databases() -> &'static str {
 
 pub fn schemas(driver: DbDriver, system: bool) -> &'static str {
     match driver {
+        DbDriver::Jdbc => unreachable!("JDBC introspection uses DatabaseMetaData"),
         DbDriver::Sqlite => "SELECT name FROM pragma_database_list WHERE name <> 'temp' ORDER BY seq",
         DbDriver::Clickhouse if system => "SELECT name FROM system.databases ORDER BY name",
         DbDriver::Clickhouse => {
@@ -114,6 +115,7 @@ pub fn schemas(driver: DbDriver, system: bool) -> &'static str {
 /// Rows: `name, kind` where kind is `table`, `view` or `materialized view`.
 pub fn tables(driver: DbDriver, schema: &str) -> String {
     match driver {
+        DbDriver::Jdbc => unreachable!("JDBC introspection uses DatabaseMetaData"),
         DbDriver::Clickhouse => format!(
             "SELECT name, CASE engine WHEN 'View' THEN 'view' WHEN 'MaterializedView' THEN 'materialized view' \
              WHEN 'WindowView' THEN 'view' ELSE 'table' END FROM system.tables \
@@ -164,6 +166,7 @@ const SNOWFLAKE_TYPE: &str = "CASE WHEN data_type = 'NUMBER' THEN 'NUMBER(' || n
 pub fn columns(driver: DbDriver, schema: &str, table: &str) -> String {
     let (s, t) = (quote_literal(driver, schema), quote_literal(driver, table));
     match driver {
+        DbDriver::Jdbc => unreachable!("JDBC introspection uses DatabaseMetaData"),
         DbDriver::Clickhouse => format!(
             "SELECT name, type, CASE WHEN startsWith(type, 'Nullable(') \
              OR startsWith(type, 'LowCardinality(Nullable(') THEN 'YES' ELSE 'NO' END, \
@@ -219,9 +222,13 @@ pub fn columns(driver: DbDriver, schema: &str, table: &str) -> String {
 }
 
 /// Rows: `index name, unique (0/1), column` (one row per indexed column, in order).
+// Key columns are paired from one series up to `max_index_keys` (the server's INDEX_MAX_KEYS, the
+// most columns an index or key has): unlike a series per catalog row, it lets the planner find the
+// table's rows through the catalog's index first.
 pub fn indexes(driver: DbDriver, schema: &str, table: &str) -> String {
     let (s, t) = (quote_literal(driver, schema), quote_literal(driver, table));
     match driver {
+        DbDriver::Jdbc => unreachable!("JDBC introspection uses DatabaseMetaData"),
         DbDriver::Clickhouse => format!(
             "SELECT * FROM (SELECT 'PRIMARY KEY' AS index_name, 0 AS is_unique, primary_key AS expression \
              FROM system.tables WHERE database = {s} AND name = {t} AND primary_key != '' \
@@ -236,8 +243,8 @@ pub fn indexes(driver: DbDriver, schema: &str, table: &str) -> String {
             "SELECT i.relname, CASE WHEN ix.indisunique THEN 1 ELSE 0 END, a.attname \
              FROM pg_index ix JOIN pg_class t ON t.oid = ix.indrelid JOIN pg_class i ON i.oid = ix.indexrelid \
              JOIN pg_namespace n ON n.oid = t.relnamespace \
-             JOIN LATERAL unnest(ix.indkey) WITH ORDINALITY AS k(attnum, ord) ON true \
-             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = k.attnum \
+             JOIN generate_series(0, current_setting('max_index_keys')::int - 1) AS k(ord) ON k.ord < ix.indnatts \
+             JOIN pg_attribute a ON a.attrelid = t.oid AND a.attnum = ix.indkey[k.ord] \
              WHERE n.nspname = {s} AND t.relname = {t} ORDER BY i.relname, k.ord"
         ),
         DbDriver::Mysql => format!(
@@ -266,6 +273,7 @@ pub fn indexes(driver: DbDriver, schema: &str, table: &str) -> String {
 /// for SQL completion, grouped by table in column order.
 pub fn completion_columns(driver: DbDriver) -> &'static str {
     match driver {
+        DbDriver::Jdbc => unreachable!("JDBC introspection uses DatabaseMetaData"),
         DbDriver::Clickhouse => {
             "SELECT c.database, c.table, CASE t.engine WHEN 'View' THEN 'view' \
              WHEN 'MaterializedView' THEN 'materialized view' WHEN 'WindowView' THEN 'view' ELSE 'table' END, \
@@ -284,12 +292,15 @@ pub fn completion_columns(driver: DbDriver) -> &'static str {
              FROM sqlite_master m JOIN pragma_table_info(m.name) p \
              WHERE m.type IN ('table', 'view') AND m.name NOT LIKE 'sqlite\\_%' ESCAPE '\\' ORDER BY m.name, p.cid"
         }
+        // Identity columns own their sequence through an internal dependency (`attidentity` is PostgreSQL 10+).
         DbDriver::Postgres => {
             "SELECT n.nspname, c.relname, CASE c.relkind WHEN 'v' THEN 'view' WHEN 'm' THEN 'materialized view' ELSE 'table' END, a.attname, \
              format_type(a.atttypid, a.atttypmod), CASE WHEN a.attnotnull THEN 'NO' ELSE 'YES' END, \
              CASE WHEN EXISTS (SELECT 1 FROM pg_index i WHERE i.indrelid = c.oid AND i.indisprimary \
                AND a.attnum = ANY(i.indkey)) THEN 1 ELSE 0 END, \
-             CASE WHEN a.atthasdef OR a.attidentity <> '' THEN 1 ELSE 0 END \
+             CASE WHEN a.atthasdef OR EXISTS (SELECT 1 FROM pg_depend d WHERE d.refclassid = 'pg_class'::regclass \
+               AND d.refobjid = c.oid AND d.refobjsubid = a.attnum AND d.classid = 'pg_class'::regclass \
+               AND d.deptype = 'i') THEN 1 ELSE 0 END \
              FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace JOIN pg_attribute a ON a.attrelid = c.oid \
              WHERE c.relkind IN ('r', 'v', 'm', 'p', 'f') AND a.attnum > 0 AND NOT a.attisdropped \
              AND n.nspname NOT IN ('pg_catalog', 'information_schema') \
@@ -351,6 +362,7 @@ pub fn completion_columns(driver: DbDriver) -> &'static str {
 /// when the key references the primary key implicitly.
 pub fn foreign_keys(driver: DbDriver) -> &'static str {
     match driver {
+        DbDriver::Jdbc => unreachable!("JDBC introspection uses DatabaseMetaData"),
         DbDriver::Clickhouse => "SELECT '', '', '', '', '', '', '' WHERE 0",
         DbDriver::Snowflake => "SELECT '', '', '', '', '', '', '' WHERE 1 = 0",
         DbDriver::Sqlite => {
@@ -363,9 +375,9 @@ pub fn foreign_keys(driver: DbDriver) -> &'static str {
              FROM pg_constraint con \
              JOIN pg_class sc ON sc.oid = con.conrelid JOIN pg_namespace sn ON sn.oid = sc.relnamespace \
              JOIN pg_class tc ON tc.oid = con.confrelid JOIN pg_namespace tn ON tn.oid = tc.relnamespace \
-             CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(s, t, ord) \
-             JOIN pg_attribute sa ON sa.attrelid = sc.oid AND sa.attnum = k.s \
-             JOIN pg_attribute ta ON ta.attrelid = tc.oid AND ta.attnum = k.t \
+             JOIN generate_series(1, current_setting('max_index_keys')::int) AS k(ord) ON k.ord <= array_upper(con.conkey, 1) \
+             JOIN pg_attribute sa ON sa.attrelid = sc.oid AND sa.attnum = con.conkey[k.ord] \
+             JOIN pg_attribute ta ON ta.attrelid = tc.oid AND ta.attnum = con.confkey[k.ord] \
              WHERE con.contype = 'f' AND sn.nspname NOT IN ('pg_catalog', 'information_schema') \
              ORDER BY 1, 2, 3, k.ord LIMIT 20000"
         }
@@ -403,12 +415,13 @@ pub fn foreign_keys(driver: DbDriver) -> &'static str {
 pub fn table_foreign_keys(driver: DbDriver, schema: &str, table: &str) -> String {
     let (s, t) = (quote_literal(driver, schema), quote_literal(driver, table));
     match driver {
+        DbDriver::Jdbc => unreachable!("JDBC introspection uses DatabaseMetaData"),
         DbDriver::Clickhouse | DbDriver::Snowflake => foreign_keys(driver).to_owned(),
         DbDriver::Sqlite => format!(
             "SELECT {s}, {t}, f.id, f.\"from\", {s}, f.\"table\", f.\"to\"              FROM pragma_foreign_key_list({t}, {s}) f ORDER BY f.id, f.seq"
         ),
         DbDriver::Postgres => format!(
-            "SELECT sn.nspname, sc.relname, con.conname, sa.attname, tn.nspname, tc.relname, ta.attname              FROM pg_constraint con              JOIN pg_class sc ON sc.oid = con.conrelid JOIN pg_namespace sn ON sn.oid = sc.relnamespace              JOIN pg_class tc ON tc.oid = con.confrelid JOIN pg_namespace tn ON tn.oid = tc.relnamespace              CROSS JOIN LATERAL unnest(con.conkey, con.confkey) WITH ORDINALITY AS k(s, t, ord)              JOIN pg_attribute sa ON sa.attrelid = sc.oid AND sa.attnum = k.s              JOIN pg_attribute ta ON ta.attrelid = tc.oid AND ta.attnum = k.t              WHERE con.contype = 'f' AND sn.nspname = {s} AND sc.relname = {t} ORDER BY 3, k.ord"
+            "SELECT sn.nspname, sc.relname, con.conname, sa.attname, tn.nspname, tc.relname, ta.attname              FROM pg_constraint con              JOIN pg_class sc ON sc.oid = con.conrelid JOIN pg_namespace sn ON sn.oid = sc.relnamespace              JOIN pg_class tc ON tc.oid = con.confrelid JOIN pg_namespace tn ON tn.oid = tc.relnamespace              JOIN generate_series(1, current_setting('max_index_keys')::int) AS k(ord) ON k.ord <= array_upper(con.conkey, 1)              JOIN pg_attribute sa ON sa.attrelid = sc.oid AND sa.attnum = con.conkey[k.ord]              JOIN pg_attribute ta ON ta.attrelid = tc.oid AND ta.attnum = con.confkey[k.ord]              WHERE con.contype = 'f' AND sn.nspname = {s} AND sc.relname = {t} ORDER BY 3, k.ord"
         ),
         DbDriver::Mysql => format!(
             "SELECT table_schema, table_name, constraint_name, column_name,              referenced_table_schema, referenced_table_name, referenced_column_name              FROM information_schema.key_column_usage WHERE referenced_table_name IS NOT NULL              AND table_schema = {s} AND table_name = {t} ORDER BY constraint_name, ordinal_position"
@@ -426,7 +439,7 @@ pub fn table_foreign_keys(driver: DbDriver, schema: &str, table: &str) -> String
 pub fn current_schema(driver: DbDriver) -> Option<&'static str> {
     match driver {
         DbDriver::Clickhouse => Some("SELECT currentDatabase()"),
-        DbDriver::Sqlite => None,
+        DbDriver::Sqlite | DbDriver::Jdbc => None,
         DbDriver::Postgres => Some("SELECT current_schema()"),
         DbDriver::Mysql => Some("SELECT DATABASE()"),
         DbDriver::SqlServer => Some("SELECT DB_NAME()"),
@@ -440,7 +453,7 @@ pub fn current_schema(driver: DbDriver) -> Option<&'static str> {
 /// has no schema to switch — SQLite's `main`, ClickHouse's `USE` differs).
 pub fn use_schema(driver: DbDriver, schema: &str) -> Option<String> {
     match driver {
-        DbDriver::Sqlite | DbDriver::Clickhouse => None,
+        DbDriver::Sqlite | DbDriver::Clickhouse | DbDriver::Jdbc => None,
         DbDriver::Postgres => Some(format!("SET search_path TO {}", quote_ident(driver, schema))),
         DbDriver::Mysql | DbDriver::SqlServer => Some(format!("USE {}", quote_ident(driver, schema))),
         DbDriver::Oracle => Some(format!("ALTER SESSION SET CURRENT_SCHEMA = {}", quote_ident(driver, schema))),
@@ -456,17 +469,13 @@ pub struct SortKey {
     pub descending: bool,
 }
 
-/// One page of a table: `limit + 1` rows so the caller knows whether more exist.
-pub fn table_page(
-    driver: DbDriver,
-    schema: &str,
-    table: &str,
+pub(crate) fn table_select(
+    qualified_name: &str,
     filter: Option<&str>,
     sort: &[SortKey],
-    offset: u64,
-    limit: u64,
+    quote: impl Fn(&str) -> String,
 ) -> String {
-    let mut sql = format!("SELECT * FROM {}", qualified(driver, schema, table));
+    let mut sql = format!("SELECT * FROM {}", qualified_name);
     if let Some(f) = filter.map(str::trim).filter(|f| !f.is_empty()) {
         let mut f = f.strip_prefix("WHERE ").or_else(|| f.strip_prefix("where ")).unwrap_or(f);
         if let Some(i) = f.find(';') {
@@ -478,12 +487,24 @@ pub fn table_page(
         }
     }
     if !sort.is_empty() {
-        let keys: Vec<String> = sort
-            .iter()
-            .map(|k| format!("{}{}", quote_ident(driver, &k.column), if k.descending { " DESC" } else { "" }))
-            .collect();
+        let keys: Vec<String> =
+            sort.iter().map(|k| format!("{}{}", quote(&k.column), if k.descending { " DESC" } else { "" })).collect();
         sql.push_str(&format!(" ORDER BY {}", keys.join(", ")));
     }
+    sql
+}
+
+/// One page of a table: `limit + 1` rows so the caller knows whether more exist.
+pub fn table_page(
+    driver: DbDriver,
+    schema: &str,
+    table: &str,
+    filter: Option<&str>,
+    sort: &[SortKey],
+    offset: u64,
+    limit: u64,
+) -> String {
+    let mut sql = table_select(&qualified(driver, schema, table), filter, sort, |name| quote_ident(driver, name));
     if driver == DbDriver::SqlServer {
         if sort.is_empty() {
             sql.push_str(" ORDER BY (SELECT 1)");
@@ -529,6 +550,9 @@ fn where_key(driver: DbDriver, key: &[CellValue]) -> String {
 /// The DML statement for `edit`. Values are written as quoted literals, which
 /// every supported database coerces to the column type.
 pub fn edit_statement(driver: DbDriver, schema: &str, table: &str, edit: &DbRowEdit) -> Result<String, String> {
+    if driver == DbDriver::Jdbc {
+        return Err("Custom JDBC table editing is unsupported".into());
+    }
     if driver == DbDriver::Clickhouse {
         return Err("ClickHouse table editing is unsupported: primary keys do not uniquely identify rows and edits require transactions".into());
     }
@@ -625,6 +649,7 @@ pub fn postgres_ddl_indexes(oid: u32) -> String {
 pub fn triggers(driver: DbDriver, schema: &str, table: &str) -> String {
     let (s, t) = (quote_literal(driver, schema), quote_literal(driver, table));
     match driver {
+        DbDriver::Jdbc => unreachable!("JDBC introspection uses DatabaseMetaData"),
         DbDriver::Clickhouse => "SELECT '', '', '' WHERE 0".to_owned(),
         DbDriver::Snowflake => "SELECT '', '', '' WHERE 1 = 0".to_owned(),
         DbDriver::Sqlite => format!(
@@ -671,11 +696,21 @@ pub fn sqlite_trigger_event(sql: &str) -> (String, String) {
     (timing.to_owned(), event.to_ascii_lowercase())
 }
 
+/// PostgreSQL catalog query `sql` of this module for servers whose catalog predates a column
+/// it reads: PostgreSQL before 11 (`prokind`), and the servers built on an older PostgreSQL
+/// (openGauss, GaussDB). `None` when it reads none.
+pub fn postgres_legacy(sql: &str) -> Option<String> {
+    let legacy = sql
+        .replace("CASE WHEN p.prokind = 'p' THEN 'procedure' ELSE 'function' END", "'function'")
+        .replace("p.prokind IN ('f', 'p')", "NOT p.proisagg AND NOT p.proiswindow");
+    (legacy != sql).then_some(legacy)
+}
+
 /// Rows: `name, kind (function/procedure), arguments, result` of a schema's routines (none in SQLite).
 pub fn routines(driver: DbDriver, schema: &str) -> Option<String> {
     let s = quote_literal(driver, schema);
     match driver {
-        DbDriver::Sqlite | DbDriver::Clickhouse => None,
+        DbDriver::Sqlite | DbDriver::Clickhouse | DbDriver::Jdbc => None,
         // Functions of extensions are left out, as in IDEA.
         DbDriver::Postgres => Some(format!(
             "SELECT p.proname, CASE WHEN p.prokind = 'p' THEN 'procedure' ELSE 'function' END, \
@@ -1171,5 +1206,33 @@ mod tests {
         assert!(edit_statement(driver, "PUBLIC", "T", &DbRowEdit::Insert { values: vec![] }).is_err());
         assert_eq!(crate::conn::begin_statement(driver), "BEGIN");
         assert_eq!(crate::plan::explain_statement(driver, "select 1;"), "EXPLAIN USING TABULAR select 1");
+    }
+
+    #[test]
+    fn postgres_catalog_queries_run_on_older_servers() {
+        let pg = DbDriver::Postgres;
+        // Neither LATERAL (9.3), WITH ORDINALITY (9.4) nor attidentity (10) in any metadata query:
+        // openGauss / GaussDB parse 9.2's grammar and catalog. `prokind` (11) has its legacy rerun.
+        let queries = [
+            schemas(pg, false).to_owned(),
+            schemas(pg, true).to_owned(),
+            tables(pg, "s"),
+            columns(pg, "s", "t"),
+            indexes(pg, "s", "t"),
+            completion_columns(pg).to_owned(),
+            foreign_keys(pg).to_owned(),
+            table_foreign_keys(pg, "s", "t"),
+            triggers(pg, "s", "t"),
+            routines(pg, "s").unwrap(),
+            sequences(pg, "s").unwrap(),
+        ];
+        for q in queries {
+            let upper = q.to_uppercase();
+            assert!(!["LATERAL", "ORDINALITY", "ATTIDENTITY"].iter().any(|w| upper.contains(w)), "{q}");
+        }
+        assert_eq!(postgres_legacy(completion_columns(pg)), None);
+        let routines = postgres_legacy(&routines(pg, "s").unwrap()).unwrap();
+        assert!(!routines.contains("prokind") && routines.contains("NOT p.proisagg"));
+        assert_eq!(postgres_legacy(&indexes(pg, "s", "t")), None);
     }
 }

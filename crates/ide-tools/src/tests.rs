@@ -50,6 +50,24 @@ fn find<'a>(list: &'a [ToolInfo], name: &str) -> &'a ToolInfo {
 }
 
 #[test]
+fn unity_adapter_download_is_pinned_and_checksum_verified() {
+    let env = Env::new();
+    let tools = env.tools();
+    let spec = registry::find("unity-debug").unwrap();
+    let Method::Release { source, assets, locate } = spec.method else { panic!("expected release") };
+    // A fixed release resolves without a network request.
+    let curl = env.sys.join(if cfg!(windows) { "curl.exe" } else { "curl" });
+    fs::write(&curl, b"unused").unwrap();
+    archive::make_executable(&curl).unwrap();
+    let http = Http::new(env.sys.as_os_str()).unwrap();
+    let download = tools.resolve_release(&http, source, assets, &CancellationToken::new()).unwrap();
+    assert_eq!(download.version, "3.0.1");
+    assert!(download.url.starts_with("https://github.com/Unity-Technologies/vscode-unity-debug/releases/download/"));
+    assert_eq!(download.sha256.as_deref(), Some("4fa00660e0b52b0413726f80962e7d3d6efd41ac6cfd4df39520cae4a8ba5bd0"));
+    assert_eq!(locate, &["UnityDebug.exe"]);
+}
+
+#[test]
 fn bundled_lombok_replaces_legacy_installs_on_every_platform_without_downloads() {
     for os in [Os::Mac, Os::Linux, Os::Windows] {
         for arch in [platform::Arch::Arm64, platform::Arch::X64] {
@@ -175,8 +193,8 @@ fn interchangeable_servers_list_their_alternatives() {
         assert_eq!(find(&list, name).alternatives, python);
     }
     assert_eq!(find(&list, "vtsls").alternatives, ["vtsls", "typescript-language-server"]);
-    for name in ["jdtls", "kmp-lsp"] {
-        assert_eq!(find(&list, name).alternatives, ["jdtls", "kmp-lsp"]);
+    for name in ["jdtls", "java-analyzer", "kmp-lsp"] {
+        assert_eq!(find(&list, name).alternatives, ["jdtls", "java-analyzer", "kmp-lsp"]);
         assert_eq!(find(&list, name).languages, if name == "kmp-lsp" { &["Java", "Kotlin"][..] } else { &["Java"] });
     }
     for name in ["kotlin-lsp", "kotlin-language-server"] {
@@ -297,9 +315,10 @@ fn concurrent_installs_of_one_tool_are_rejected() {
 
 /// A second caller mid-install joins the run (the other Settings window's
 /// duplicate install) and shares the result instead of `AlreadyExists`.
+// Slot names no real install in other tests uses: tests share the process-wide slots.
 #[test]
 fn second_install_joins_the_running_one() {
-    let slot = match install_slot("sqls", &CancellationToken::new()) {
+    let slot = match install_slot("join-test-slot", &CancellationToken::new()) {
         Ok(slot) => slot,
         Err(_) => panic!("no install is running"),
     };
@@ -310,7 +329,7 @@ fn second_install_joins_the_running_one() {
                 slot.broadcast(InstallEvent::Line { text: format!("line {i}") });
                 std::thread::sleep(Duration::from_millis(20));
             }
-            release_install_slot("sqls", &slot);
+            release_install_slot("join-test-slot", &slot);
             slot.finish(Err(IdeError::new(ErrorKind::Io, "compile failed")));
         })
     };
@@ -330,8 +349,8 @@ fn second_install_joins_the_running_one() {
     assert!(texts.contains(&"Joined the install already in progress…".to_string()), "{texts:?}");
     assert!(texts.iter().any(|l| l == "line 2"), "{texts:?}");
     // The slot is released: a fresh install can start.
-    match install_slot("sqls", &CancellationToken::new()) {
-        Ok(fresh) => release_install_slot("sqls", &fresh),
+    match install_slot("join-test-slot", &CancellationToken::new()) {
+        Ok(fresh) => release_install_slot("join-test-slot", &fresh),
         Err(_) => panic!("the finished install still holds its slot"),
     }
 }
@@ -339,7 +358,7 @@ fn second_install_joins_the_running_one() {
 /// A late caller gets the finished result without waiting.
 #[test]
 fn install_joined_after_it_finished_returns_the_result() {
-    let slot = match install_slot("marksman", &CancellationToken::new()) {
+    let slot = match install_slot("finished-test-slot", &CancellationToken::new()) {
         Ok(slot) => slot,
         Err(_) => panic!("no install is running"),
     };
@@ -362,8 +381,9 @@ fn install_joined_after_it_finished_returns_the_result() {
         default_args: vec![],
         default_initialization_options: None,
         alternatives: vec![],
+        companion: false,
     };
-    release_install_slot("marksman", &slot);
+    release_install_slot("finished-test-slot", &slot);
     slot.finish(Ok(ok));
     let info = join_install(&slot, &CancellationToken::new(), &|_| {}).unwrap();
     assert_eq!(info.version.as_deref(), Some("1.0"));
@@ -405,7 +425,7 @@ fn release_install_end_to_end_without_network() {
         "curl",
         &format!(
             r#"out=""; url=""
-while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -A|-H|--retry|--connect-timeout) shift 2;; -*) shift;; *) url="$1"; shift;; esac; done
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -A|-H|--retry|--connect-timeout|--speed-limit|--speed-time) shift 2;; -*) shift;; *) url="$1"; shift;; esac; done
 case "$url" in
   https://api.github.com/*) /bin/cat '{json}';;
   *) /bin/cp '{archive}' "$out";;
@@ -439,6 +459,51 @@ esac"#,
     let err = env.tools().install("lua-language-server", &langs(), &CancellationToken::new(), &|_| {}).unwrap_err();
     assert!(err.message.contains("checksum mismatch"), "{}", err.message);
     assert!(exe.exists());
+}
+
+/// A PHP archive release (phpactor) keeps its `.phar` name and is launched through `php`.
+#[cfg(unix)]
+#[test]
+fn phar_release_installs_with_a_php_launcher() {
+    let env = Env::new();
+    let fixtures = env.root.parent().unwrap().join("fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    let phar = fixtures.join("phpactor.phar");
+    fs::write(&phar, b"<?php __HALT_COMPILER();").unwrap();
+    let digest = sources::sha256_file(&phar).unwrap();
+    let json = fixtures.join("release.json");
+    fs::write(
+        &json,
+        format!(
+            r#"{{"tag_name":"2026.10.07.0","assets":[{{"name":"phpactor.phar","browser_download_url":"https://example.invalid/phpactor.phar","size":{},"digest":"sha256:{digest}"}}]}}"#,
+            fs::metadata(&phar).unwrap().len()
+        ),
+    )
+    .unwrap();
+    env.script(
+        &env.sys,
+        "curl",
+        &format!(
+            r#"out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -A|-H|--retry|--connect-timeout|--speed-limit|--speed-time) shift 2;; -*) shift;; *) url="$1"; shift;; esac; done
+case "$url" in
+  https://api.github.com/*) /bin/cat '{json}';;
+  *) /bin/cp '{phar}' "$out";;
+esac"#,
+            json = json.display(),
+            phar = phar.display()
+        ),
+    );
+    env.script(&env.sys, "php", r#"echo "php $*""#);
+
+    let info = env.tools().install("phpactor", &langs(), &CancellationToken::new(), &|_| {}).unwrap();
+    assert_eq!(info.status, ToolStatus::Installed);
+    let launcher = env.root.join("phpactor/bin/phpactor");
+    assert_eq!(info.path.as_deref(), Some(launcher.as_path()));
+    let archive = env.root.join("phpactor/bin/phpactor.phar");
+    assert_eq!(fs::read(&archive).unwrap(), b"<?php __HALT_COMPILER();");
+    let out = Command::new(&launcher).arg("language-server").env("PATH", &env.sys).output().unwrap();
+    assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), format!("php {} language-server", archive.display()));
 }
 
 /// npm installs go to `<tools>/node_modules` with `--prefix`.
@@ -478,6 +543,64 @@ echo "added 1 package""#,
     assert!(args.contains("install") && args.contains("bash-language-server@latest"), "{args}");
     assert!(args.contains(&env.root.display().to_string()), "{args}");
     assert!(env.root.join("package.json").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn npm_install_retries_against_public_registry_on_mirror_miss_and_preserves_primary_error_when_unreachable() {
+    let env = Env::new();
+    let log = env.root.parent().unwrap().join("npm-fallback.txt");
+    env.script(&env.sys, "node", "exit 0");
+    env.script(
+        &env.sys,
+        "npm",
+        &format!(
+            r#"echo "$@" >> '{log}'
+case " $* " in
+  *" --registry=https://registry.npmjs.org/ --@vtsls:registry=https://registry.npmjs.org/ "*)
+    prefix=""; while [ $# -gt 0 ]; do [ "$1" = "--prefix" ] && prefix="$2"; shift; done
+    /bin/mkdir -p "$prefix/node_modules/.bin" "$prefix/node_modules/@vtsls/language-server"
+    printf '#!/bin/sh\necho 0.2.9\n' > "$prefix/node_modules/.bin/vtsls"
+    /bin/chmod +x "$prefix/node_modules/.bin/vtsls"
+    echo '{{"version":"0.2.9"}}' > "$prefix/node_modules/@vtsls/language-server/package.json"
+    exit 0
+    ;;
+  *)
+    echo "npm error code ETARGET" >&2
+    echo "npm error notarget No matching version found for @vtsls/language-server@latest." >&2
+    exit 1
+    ;;
+esac"#,
+            log = log.display()
+        ),
+    );
+    let info = env.tools().install("vtsls", &langs(), &CancellationToken::new(), &|_| {}).unwrap();
+    assert_eq!(info.status, ToolStatus::Installed);
+    let calls: Vec<String> = fs::read_to_string(&log).unwrap().lines().map(str::to_owned).collect();
+    assert_eq!(calls.len(), 2, "{calls:?}");
+    assert!(!calls[0].contains("--registry="), "{calls:?}");
+    assert!(calls[1].contains("--registry=https://registry.npmjs.org/"), "{calls:?}");
+    assert!(calls[1].contains("--@vtsls:registry=https://registry.npmjs.org/"), "{calls:?}");
+
+    // When public npmjs.org is blocked (e.g. corporate firewall), surface the primary mirror error.
+    env.script(
+        &env.sys,
+        "npm",
+        r#"case " $* " in
+  *" --registry=https://registry.npmjs.org/ "*)
+    echo "npm error code ECONNRESET" >&2
+    exit 1
+    ;;
+  *)
+    echo "npm error code ETARGET" >&2
+    echo "npm error notarget No matching version found for pyright@latest." >&2
+    exit 1
+    ;;
+esac"#,
+    );
+    let err = env.tools().install("pyright", &langs(), &CancellationToken::new(), &|_| {}).unwrap_err();
+    assert!(err.message.contains("No matching version found for pyright@latest"), "{}", err.message);
+    assert!(!err.message.contains("ECONNRESET"), "{}", err.message);
 }
 
 /// Servers that load TypeScript as a library get one with its JS API: `@latest`
@@ -877,9 +1000,14 @@ esac
     }
 }
 
+/// Installs of one tool name share a process-wide slot: tests installing debugpy take turns.
+#[cfg(unix)]
+static DEBUGPY_INSTALL: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
+
 #[cfg(unix)]
 #[test]
 fn selected_python_is_used_for_pip_and_uv_even_with_a_versioned_filename() {
+    let _guard = DEBUGPY_INSTALL.lock();
     let env = Env::new();
     env.script(&env.sys, "python3", "exit 99");
     let sdk = env._tmp.path().join("python-sdk");
@@ -915,6 +1043,51 @@ exit 1
     let _ = tools.install("ruff", &langs(), &CancellationToken::new(), &|_| {});
     let args = fs::read_to_string(log).unwrap();
     assert!(args.contains(&format!("--python {}", sdk.join("python3.14").display())), "{args}");
+}
+
+/// A virtualenv made by uv has no pip: debugpy's private copy is made with pip through uv.
+#[cfg(unix)]
+#[test]
+fn debugpy_installs_through_uv_when_the_selected_python_has_no_pip() {
+    let _guard = DEBUGPY_INSTALL.lock();
+    let env = Env::new();
+    let venv = env._tmp.path().join("project/.venv/bin");
+    env.script(&venv, "python", "echo \"$(basename \"$0\"): No module named pip\" >&2; exit 1");
+    let log = env._tmp.path().join("uv.log");
+    env.script(
+        &env.sys,
+        "uv",
+        &format!(
+            r#"
+echo "$@" >> '{log}'
+while [ $# -gt 0 ]; do
+    if [ "$1" = "--target" ]; then
+        /bin/mkdir -p "$2/debugpy" "$2/debugpy-1.8.0.dist-info"
+        /usr/bin/touch "$2/debugpy/__init__.py"
+        exit 0
+    fi
+    shift
+done
+exit 1
+"#,
+            log = log.display()
+        ),
+    );
+    let tools = env.tools().with_runtime(BTreeMap::from([("python".into(), venv.join("python"))]), BTreeMap::new());
+    let lines = Mutex::new(Vec::new());
+    let info = tools
+        .install("debugpy", &langs(), &CancellationToken::new(), &|e| {
+            if let InstallEvent::Line { text } = e {
+                lines.lock().push(text);
+            }
+        })
+        .unwrap();
+    assert_eq!(info.status, ToolStatus::Installed);
+    assert_eq!(info.version.as_deref(), Some("1.8.0"));
+    let args = fs::read_to_string(log).unwrap();
+    assert!(args.starts_with("tool run pip install "), "{args}");
+    assert!(args.contains("--platform any"), "{args}");
+    assert!(lines.lock().iter().any(|l| l.contains("has no pip")));
 }
 
 #[test]
@@ -957,4 +1130,104 @@ fn npm_tools_report_a_newer_registry_version() {
         vec![ToolUpdate { name: "bash-language-server".into(), current: "5.4.0".into(), latest: "5.6.1".into() }]
     );
     assert_eq!(tools("5.4.0").updates(&cancel).unwrap(), vec![]);
+}
+
+/// Tools › Download sources: a configured mirror serves a GitHub release the official host
+/// cannot, and the official host is kept as the fallback.
+#[cfg(unix)]
+#[test]
+fn a_mirror_serves_what_the_official_host_cannot() {
+    let env = Env::new();
+    let fixtures = env.root.parent().unwrap().join("fixtures");
+    fs::create_dir_all(&fixtures).unwrap();
+    let archive = fixtures.join("lls.tar.gz");
+    {
+        let gz = flate2::write::GzEncoder::new(fs::File::create(&archive).unwrap(), flate2::Compression::fast());
+        let mut b = tar::Builder::new(gz);
+        let body = b"#!/bin/sh\necho 3.13.5\n";
+        let mut h = tar::Header::new_gnu();
+        h.set_size(body.len() as u64);
+        h.set_mode(0o755);
+        h.set_cksum();
+        b.append_data(&mut h, "bin/lua-language-server", &body[..]).unwrap();
+        b.into_inner().unwrap().finish().unwrap();
+    }
+    let digest = sources::sha256_file(&archive).unwrap();
+    // Release assets live on github.com: only those addresses are mirrored.
+    let assets: Vec<String> = ["darwin-arm64.tar.gz", "darwin-x64.tar.gz", "linux-x64.tar.gz", "linux-arm64.tar.gz"]
+        .iter()
+        .map(|s| {
+            format!(
+                r#"{{"name":"lua-language-server-3.13.5-{s}","browser_download_url":"https://github.com/LuaLS/lua-language-server/releases/download/3.13.5/{s}","size":{},"digest":"sha256:{digest}"}}"#,
+                fs::metadata(&archive).unwrap().len()
+            )
+        })
+        .collect();
+    let json = fixtures.join("release.json");
+    fs::write(&json, format!(r#"{{"tag_name":"3.13.5","assets":[{}]}}"#, assets.join(","))).unwrap();
+    // The mirror serves the asset; the official host is unreachable.
+    let log = fixtures.join("asked.log");
+    env.script(
+        &env.sys,
+        "curl",
+        &format!(
+            r#"out=""; url=""
+while [ $# -gt 0 ]; do case "$1" in -o) out="$2"; shift 2;; -A|-H|--retry|--connect-timeout) shift 2;; -*) shift;; *) url="$1"; shift;; esac; done
+/bin/echo "$url" >> '{log}'
+case "$url" in
+  https://api.github.com/*) /bin/cat '{json}';;
+  https://mirror.test/https://github.com/*) /bin/cp '{archive}' "$out";;
+  *) exit 22;;
+esac"#,
+            log = log.display(),
+            json = json.display(),
+            archive = archive.display()
+        ),
+    );
+    let downloads = ToolDownloadSettings { github_mirror: "https://mirror.test/".into() };
+    let emit = |_: InstallEvent| {};
+    env.tools()
+        .with_downloads(downloads)
+        .install("lua-language-server", &langs(), &CancellationToken::new(), &emit)
+        .unwrap();
+    let asked = fs::read_to_string(&log).unwrap();
+    // A configured mirror is tried first — waiting for a slow official host would defeat it.
+    let mirror_at = asked.find("https://mirror.test/https://github.com/").expect("the mirror is tried");
+    assert!(!asked[..mirror_at].contains("releases/download"), "the mirror goes first: {asked}");
+}
+
+/// A mirror may only deliver bytes something can vouch for; the official host may not.
+#[test]
+fn a_mirror_never_installs_what_it_alone_vouches_for() {
+    let tmp = tempfile::tempdir().unwrap();
+    let archive = tmp.path().join("tool.tar.gz");
+    fs::write(&archive, b"bytes").unwrap();
+    let digest = sources::sha256_file(&archive).unwrap();
+    let dl = |sha256: Option<&str>| sources::Download {
+        version: "1.0.0".into(),
+        name: "tool.tar.gz".into(),
+        url: "https://github.com/o/r/releases/download/v1/tool.tar.gz".into(),
+        size: None,
+        sha256: sha256.map(str::to_owned),
+        checksum_url: None,
+    };
+    let lines = Mutex::new(Vec::new());
+    let emit = |e: InstallEvent| {
+        if let InstallEvent::Line { text } = e {
+            lines.lock().push(text);
+        }
+    };
+
+    // Nothing published: the official host is trusted, a mirror is not.
+    check_sha256(&archive, &dl(None), None, false, &emit).unwrap();
+    let err = check_sha256(&archive, &dl(None), None, true, &emit).unwrap_err();
+    assert!(err.message.contains("no published checksum"), "{}", err.message);
+
+    // A matching hash passes from either source.
+    check_sha256(&archive, &dl(Some(&digest)), Some(&digest), true, &emit).unwrap();
+    assert!(lines.lock().iter().any(|l| l.contains("Checksum verified")));
+
+    // A mismatch is refused whoever served it.
+    let err = check_sha256(&archive, &dl(Some(&digest)), Some(&"0".repeat(64)), true, &emit).unwrap_err();
+    assert!(err.message.contains("checksum mismatch"), "{}", err.message);
 }

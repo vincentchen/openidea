@@ -5,15 +5,22 @@
 
 mod fingerprint;
 mod launch_resources;
+mod modules;
 mod parse;
 mod single;
+mod structure;
 mod up_to_date;
 
 pub use fingerprint::{LaunchFingerprint, launch_fingerprint, menu_fingerprint};
 pub use launch_resources::process_launch_resources;
+pub use modules::record_module_build;
 pub use single::{
     SingleFileTarget, compile_file_plan, find_javac, javac_step, module_classpath, single_file_classpath,
     single_file_target,
+};
+pub use structure::{
+    StructureJdk, StructureRoots, artifact_file, artifact_output, language_release, structure_outputs, structure_plan,
+    structure_war_plan, structure_web_artifacts,
 };
 pub use up_to_date::{menu_up_to_date, record_menu_build};
 
@@ -53,6 +60,10 @@ pub enum BuildSystem {
     TypeScript,
     #[serde(rename = "cmake")]
     CMake,
+    #[serde(rename = "dotnet")]
+    Dotnet,
+    /// A Java project without a build tool, compiled from its Project Structure.
+    Javac,
 }
 
 /// One command of a build.
@@ -63,6 +74,10 @@ pub struct BuildStep {
     pub cwd: PathBuf,
     pub env: BTreeMap<String, String>,
     format: Format,
+    /// Folders created before the command runs (a compiler's output).
+    mkdirs: Vec<PathBuf>,
+    /// Work done in the IDE instead of a command, with its console title.
+    action: Option<(structure::Action, String)>,
 }
 
 impl BuildStep {
@@ -73,16 +88,26 @@ impl BuildStep {
             cwd: cwd.to_path_buf(),
             env: BTreeMap::new(),
             format,
+            mkdirs: Vec::new(),
+            action: None,
         }
+    }
+
+    fn action(action: structure::Action, root: &Path) -> Self {
+        let title = action.display(root);
+        BuildStep { action: Some((action, title)), ..Self::new("", &[], root, Format::Gradle) }
     }
 
     /// A CMake configure/build invocation, parsed as compiler output in the Build view.
     pub fn cmake(program: &str, args: Vec<String>, cwd: PathBuf, env: BTreeMap<String, String>) -> Self {
-        Self { program: program.into(), args, cwd, env, format: Format::Gcc }
+        Self { program: program.into(), args, cwd, env, format: Format::Gcc, mkdirs: Vec::new(), action: None }
     }
 
     /// The command line as echoed in the console.
     pub fn display(&self) -> String {
+        if let Some((_, title)) = &self.action {
+            return title.clone();
+        }
         let program = Path::new(&self.program).file_name().map_or(self.program.clone(), |n| n.to_string_lossy().into());
         std::iter::once(program)
             .chain(self.args.iter().map(|a| if a.contains(' ') { format!("\"{a}\"") } else { a.clone() }))
@@ -165,6 +190,8 @@ fn detect_dir(dir: &Path, model: &BuildModel, root: &Path) -> Option<BuildSystem
         || has(dir, &["build.gradle", "build.gradle.kts", "settings.gradle", "settings.gradle.kts"])
     {
         Some(BuildSystem::Gradle)
+    } else if dotnet_target(dir).is_some() {
+        Some(BuildSystem::Dotnet)
     } else if has(dir, &["Cargo.toml"]) {
         Some(BuildSystem::Cargo)
     } else if has(dir, &["go.mod", "go.work"]) {
@@ -195,12 +222,16 @@ fn ancestors_within<'a>(root: &'a Path, file: &'a Path) -> impl Iterator<Item = 
 
 /// The build of `root`, or of the module containing `file` (Build Module / Recompile).
 /// `cmake`: the CMake profiles of the settings (the first one is built), if any.
+/// `cache` enables the module-scoped Maven narrowing of `Build` project builds;
+/// `None` plans every build exactly as before.
 pub fn plan(
     root: &Path,
     model: &BuildModel,
     kind: BuildKind,
     file: Option<&Path>,
     cmake: Option<&[CMakeProfile]>,
+    cache: Option<&Path>,
+    cancel: &CancellationToken,
 ) -> IdeResult<BuildPlan> {
     let project_name = root.file_name().map_or_else(|| "project".to_owned(), |n| n.to_string_lossy().into_owned());
     let module_dir = match file {
@@ -225,7 +256,7 @@ pub fn plan(
         .or((!model.gradle.is_empty()).then_some(BuildSystem::Gradle))
         .or_else(|| model.maven.as_ref().filter(|m| !m.projects.is_empty()).map(|_| BuildSystem::Maven))
         .ok_or_else(|| {
-            IdeError::not_found("no supported build system (Maven, Gradle, Cargo, Go, TypeScript, CMake) found")
+            IdeError::not_found("no supported build system (Maven, Gradle, .NET, Cargo, Go, TypeScript, CMake) found")
         })?;
     let module = module_dir.as_deref().filter(|d| *d != root);
     let title = match module {
@@ -237,13 +268,16 @@ pub fn plan(
         None => project_name,
     };
     let steps = match system {
-        BuildSystem::Maven => maven_steps(root, model, kind, module_dir.as_deref())?,
+        BuildSystem::Maven => maven_steps(root, model, kind, module_dir.as_deref(), cache, cancel)?,
         BuildSystem::Gradle => gradle_steps(root, model, kind, module_dir.as_deref())?,
         BuildSystem::Cargo => cargo_steps(&dir, kind),
         // Go builds the file's package (a module holds many).
         BuildSystem::Go => go_steps(file.and_then(Path::parent).unwrap_or(&dir), kind)?,
         BuildSystem::TypeScript => ts_steps(&dir, kind),
         BuildSystem::CMake => cmake_steps(&dir, kind, cmake.and_then(<[_]>::first)),
+        BuildSystem::Dotnet => dotnet_steps(&dir, kind)?,
+        // Never detected from a folder: it comes from the Project Structure (`structure_plan`).
+        BuildSystem::Javac => return Err(IdeError::invalid("no build tool to run")),
     };
     Ok(BuildPlan { system, title, steps })
 }
@@ -253,6 +287,8 @@ pub(super) fn maven_steps(
     model: &BuildModel,
     kind: BuildKind,
     module: Option<&Path>,
+    cache: Option<&Path>,
+    cancel: &CancellationToken,
 ) -> IdeResult<Vec<BuildStep>> {
     let fallback;
     let m = match &model.maven {
@@ -292,7 +328,15 @@ pub(super) fn maven_steps(
         s.env = p.env.clone();
         s
     };
-    let Some(module) = module else { return Ok(tops.iter().map(|p| step(p, &[])).collect()) };
+    let Some(module) = module else {
+        if kind == BuildKind::Build
+            && let Some(cache) = cache
+            && let Some(steps) = modules::narrowed_maven_steps(cache, root, m, &step, cancel)?
+        {
+            return Ok(steps);
+        }
+        return Ok(tops.iter().map(|p| step(p, &[])).collect());
+    };
     // The reactor root containing the module builds it with what it depends on (`-pl … -am`).
     let rel = rel_str(root, module);
     if !m.projects.iter().any(|p| p.dir == rel) {
@@ -451,6 +495,33 @@ fn has_build_script(dir: &Path) -> bool {
         .is_some_and(|v| v.pointer("/scripts/build").is_some_and(serde_json::Value::is_string))
 }
 
+/// The solution (`.sln` / `.slnx`) or project (`.csproj` / `.fsproj` / `.vbproj`) file `dir`
+/// builds: a solution first, then a project; the first by name when there are several.
+fn dotnet_target(dir: &Path) -> Option<PathBuf> {
+    let mut files: Vec<PathBuf> =
+        std::fs::read_dir(dir).ok()?.flatten().map(|e| e.path()).filter(|p| p.is_file()).collect();
+    files.sort();
+    let ext = |p: &Path| p.extension().map(|e| e.to_string_lossy().to_ascii_lowercase()).unwrap_or_default();
+    let solution = files.iter().find(|p| matches!(ext(p).as_str(), "sln" | "slnx"));
+    solution.or_else(|| files.iter().find(|p| matches!(ext(p).as_str(), "csproj" | "fsproj" | "vbproj"))).cloned()
+}
+
+/// `dotnet build` of the directory's solution or project; Rebuild skips incremental builds,
+/// Build Artifacts publishes. The summary that repeats every message is left out.
+fn dotnet_steps(dir: &Path, kind: BuildKind) -> IdeResult<Vec<BuildStep>> {
+    let target = dotnet_target(dir).ok_or_else(|| IdeError::not_found("no .NET solution or project found"))?;
+    let target = target.file_name().map_or_else(String::new, |n| n.to_string_lossy().into_owned());
+    let verb = if kind == BuildKind::Artifacts { "publish" } else { "build" };
+    let mut step = BuildStep::new("dotnet", &[verb, &target, "-nologo", "-clp:NoSummary"], dir, Format::Msbuild);
+    if kind == BuildKind::Rebuild {
+        step.args.push("--no-incremental".into());
+    }
+    // The classic console logger prints the canonical `file(line,col): error` lines; the
+    // terminal logger (.NET 8+) only appears on a terminal, but rules it out for older SDKs too.
+    step.env.insert("MSBUILDTERMINALLOGGER".into(), "off".into());
+    Ok(vec![step])
+}
+
 fn ts_steps(dir: &Path, kind: BuildKind) -> Vec<BuildStep> {
     let script = has_build_script(dir);
     if script && (kind == BuildKind::Artifacts || !dir.join("tsconfig.json").is_file()) {
@@ -481,7 +552,9 @@ impl PathMap {
         let abs = if p.is_absolute() {
             p.to_path_buf()
         } else {
-            let in_base = base.map(|b| Path::new(b).join(p)).filter(|c| c.exists());
+            // rustc prints workspace members' files relative to the workspace root, above
+            // the member's manifest directory (`base`) when a member is built on its own.
+            let in_base = base.and_then(|b| Path::new(b).ancestors().map(|a| a.join(p)).find(|c| c.exists()));
             in_base.unwrap_or_else(|| cwd.join(p))
         };
         let abs = normalize(&abs);
@@ -493,7 +566,7 @@ impl PathMap {
 }
 
 /// Removes `.` and resolvable `..` components without touching the file system.
-fn normalize(p: &Path) -> PathBuf {
+pub(crate) fn normalize(p: &Path) -> PathBuf {
     use std::path::Component;
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -618,6 +691,36 @@ pub fn run(
         let command = step.display();
         on_event(BuildEvent::Step { command: command.clone(), cwd: step.cwd.clone().into() });
         on_event(BuildEvent::Progress { message: command.clone(), fraction: None });
+        if let Some((action, _)) = &step.action {
+            match action.run(cancel) {
+                Ok(text) => {
+                    if !text.is_empty() {
+                        on_event(BuildEvent::Output { text: format!("{text}\n"), stderr: false });
+                    }
+                    continue;
+                }
+                Err(e) if e.kind == ide_core::error::ErrorKind::Cancelled => return Err(e),
+                Err(e) => {
+                    let m = BuildMessage {
+                        severity: Severity::Error,
+                        text: e.message.clone(),
+                        path: None,
+                        range: None,
+                        code: None,
+                    };
+                    on_event(BuildEvent::Output { text: format!("{}\n", e.message), stderr: true });
+                    on_event(BuildEvent::Message { message: m.clone() });
+                    messages.push(m);
+                    success = false;
+                    break;
+                }
+            }
+        }
+        for dir in &step.mkdirs {
+            if let Err(e) = std::fs::create_dir_all(dir) {
+                tracing::debug!(dir = %dir.display(), %e, "cannot create the build output folder");
+            }
+        }
         let mut parser = OutputParser::new(step.format);
         let mut emit = |raws: Vec<RawMessage>, messages: &mut Vec<BuildMessage>| {
             for raw in raws {
@@ -628,7 +731,7 @@ pub fn run(
                 }
             }
         };
-        let out = process::run(&step.program, &step.args, &step.cwd, &step.env, cancel, |stream, line| {
+        let out = process::run_bounded(&step.program, &step.args, &step.cwd, &step.env, cancel, |stream, line| {
             let parsed = parser.feed(line);
             match parsed.console {
                 Some(text) if text.is_empty() => {}
@@ -670,7 +773,7 @@ pub fn run(
         if !out.success {
             success = false;
             if !messages.iter().any(|m| m.severity == Severity::Error) {
-                let summary = crate::sync::error_summary(&out.text);
+                let summary = crate::sync::error_summary(&out);
                 let text = if summary.is_empty() { last_error_line.clone() } else { summary };
                 let m = BuildMessage { severity: Severity::Error, text, path: None, range: None, code: None };
                 on_event(BuildEvent::Message { message: m.clone() });
@@ -794,8 +897,15 @@ pub fn launch_has_non_java_sources(root: &Path, model: &BuildModel, module: &Pat
     has_non_java_sources(module)
 }
 
-fn launch_plan(root: &Path, model: &BuildModel, module: &Path, test: bool, kind: BuildKind) -> IdeResult<BuildPlan> {
-    let mut plan = plan(root, model, kind, Some(module), None)?;
+fn launch_plan(
+    root: &Path,
+    model: &BuildModel,
+    module: &Path,
+    test: bool,
+    kind: BuildKind,
+    cancel: &CancellationToken,
+) -> IdeResult<BuildPlan> {
+    let mut plan = plan(root, model, kind, Some(module), None, None, cancel)?;
     if plan.system == BuildSystem::Maven && !test {
         for step in &mut plan.steps {
             if let Some(goal) = step.args.last_mut() {
@@ -822,7 +932,7 @@ pub fn build_for_launch(
     kind: BuildKind,
     cancel: &CancellationToken,
 ) -> IdeResult<LaunchBuild> {
-    let plan = launch_plan(root, model, module, test, kind)?;
+    let plan = launch_plan(root, model, module, test, kind, cancel)?;
     let result = run(root, &plan, cancel, &|_| {})?;
     let failure = if !result.success {
         let errors: Vec<String> = result
@@ -887,7 +997,9 @@ mod tests {
         write(root, "../external/main.go", "package main\nimport \"example.com/lib\"\nfunc main(){_ = lib.Value()}\n");
         // std canonicalization also exercises verbatim paths on Windows.
         for root in [root.to_path_buf(), std::fs::canonicalize(root).unwrap()] {
-            let plan = plan(&root, &BuildModel::default(), BuildKind::Build, None, None).unwrap();
+            let plan =
+                plan(&root, &BuildModel::default(), BuildKind::Build, None, None, None, &CancellationToken::new())
+                    .unwrap();
             for step in plan.steps {
                 let result = std::process::Command::new(&go)
                     .args(&step.args)
@@ -913,7 +1025,7 @@ mod tests {
         let canonical = std::fs::canonicalize(&root).unwrap();
         for root in [&root, &canonical, &canonical.join("..").join("workspace")] {
             for kind in [BuildKind::Build, BuildKind::Rebuild, BuildKind::Artifacts] {
-                let p = plan(root, &BuildModel::default(), kind, None, None).unwrap();
+                let p = plan(root, &BuildModel::default(), kind, None, None, None, &CancellationToken::new()).unwrap();
                 assert_eq!(p.system, BuildSystem::Go);
                 assert_eq!(p.steps.len(), 3);
                 for (step, module) in p.steps.iter().zip(["api", "lib with spaces", "../shared"]) {
@@ -928,20 +1040,30 @@ mod tests {
                 }
             }
         }
-        let member =
-            plan(&root, &BuildModel::default(), BuildKind::Build, Some(&root.join("api/pkg/a.go")), None).unwrap();
+        let member = plan(
+            &root,
+            &BuildModel::default(),
+            BuildKind::Build,
+            Some(&root.join("api/pkg/a.go")),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(member.steps.len(), 1);
         assert_eq!(member.steps[0].cwd, root.join("api"));
         assert_eq!(member.steps[0].args, ["build", "./pkg/..."]);
         write(&root, "go.work", "use ./missing\n");
         assert!(
-            plan(&root, &BuildModel::default(), BuildKind::Build, None, None)
+            plan(&root, &BuildModel::default(), BuildKind::Build, None, None, None, &CancellationToken::new())
                 .unwrap_err()
                 .to_string()
                 .contains("go.mod")
         );
         write(&root, "go.work", "go 1.22\n");
-        assert!(plan(&root, &BuildModel::default(), BuildKind::Build, None, None).is_err());
+        assert!(
+            plan(&root, &BuildModel::default(), BuildKind::Build, None, None, None, &CancellationToken::new()).is_err()
+        );
     }
 
     #[test]
@@ -962,11 +1084,21 @@ mod tests {
         let mut model = crate::load_linked(root, &root.join("cache"), None, &Default::default(), &settings);
         model.gradle[0].env.insert("JAVA_HOME".into(), "/jdk-a".into());
         model.gradle[1].env.insert("JAVA_HOME".into(), "/jdk-b".into());
-        let all = super::plan(root, &model, super::BuildKind::Build, None, None).unwrap();
+        let all =
+            super::plan(root, &model, super::BuildKind::Build, None, None, None, &CancellationToken::new()).unwrap();
         assert_eq!(all.steps.len(), 2);
         assert_eq!(all.steps[0].cwd, root.join("a"));
         assert_eq!(all.steps[1].cwd, root.join("b"));
-        let module = super::plan(root, &model, super::BuildKind::Rebuild, Some(&root.join("b/app")), None).unwrap();
+        let module = super::plan(
+            root,
+            &model,
+            super::BuildKind::Rebuild,
+            Some(&root.join("b/app")),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(module.steps.len(), 1);
         assert_eq!(module.steps[0].program, root.join("b").join(wrapper).to_string_lossy());
         assert_eq!(module.steps[0].cwd, root.join("b"));
@@ -979,11 +1111,31 @@ mod tests {
         let mut nested = model.gradle[1].projects[1].clone();
         nested.path = ":b:app".into();
         model.gradle[0].projects.push(nested);
-        let nested = super::plan(root, &model, super::BuildKind::Build, Some(&root.join("b/app")), None).unwrap();
+        let nested = super::plan(
+            root,
+            &model,
+            super::BuildKind::Build,
+            Some(&root.join("b/app")),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(nested.steps[0].program, root.join("b").join(wrapper).to_string_lossy());
         assert_eq!(nested.steps[0].args, ["--console=plain", ":app:classes", ":app:testClasses"]);
         model.gradle.clear();
-        assert!(super::plan(root, &model, super::BuildKind::Build, Some(&root.join("b/app")), None).is_err());
+        assert!(
+            super::plan(
+                root,
+                &model,
+                super::BuildKind::Build,
+                Some(&root.join("b/app")),
+                None,
+                None,
+                &CancellationToken::new()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -1005,18 +1157,24 @@ mod tests {
         };
         let mut model = crate::load_linked(&root, &base.join("cache"), None, &Default::default(), &settings);
         model.gradle[0].env.insert("JAVA_HOME".into(), "/external-jdk".into());
-        let all = super::plan(&root, &model, super::BuildKind::Build, None, None).unwrap();
+        let all =
+            super::plan(&root, &model, super::BuildKind::Build, None, None, None, &CancellationToken::new()).unwrap();
         assert_eq!(all.steps[0].cwd, external);
         // Linked roots are saved with forward slashes, so on Windows the program mixes separators.
         assert_eq!(std::path::Path::new(&all.steps[0].program), external.join(wrapper));
-        let module = super::plan(&root, &model, super::BuildKind::Rebuild, Some(&source), None).unwrap();
+        let module =
+            super::plan(&root, &model, super::BuildKind::Rebuild, Some(&source), None, None, &CancellationToken::new())
+                .unwrap();
         assert_eq!(module.steps[0].cwd, external);
         assert_eq!(module.steps[0].env["JAVA_HOME"], "/external-jdk");
         assert_eq!(module.steps[0].args, ["--console=plain", ":app:clean", ":app:classes", ":app:testClasses"]);
         let other = base.join("unlinked");
         std::fs::create_dir(&other).unwrap();
         std::fs::write(other.join("build.gradle"), "").unwrap();
-        assert!(super::plan(&root, &model, super::BuildKind::Build, Some(&other), None).is_err());
+        assert!(
+            super::plan(&root, &model, super::BuildKind::Build, Some(&other), None, None, &CancellationToken::new())
+                .is_err()
+        );
     }
     use super::*;
 
@@ -1057,7 +1215,7 @@ mod tests {
         write(&root, "pom.xml", "<project><artifactId>demo</artifactId></project>");
         let model = crate::load(&root, &tmp.path().join("cache"), None);
         for (kind, expected) in [(BuildKind::Build, true), (BuildKind::Rebuild, true), (BuildKind::Artifacts, false)] {
-            let plan = plan(&root, &model, kind, None, None).unwrap();
+            let plan = plan(&root, &model, kind, None, None, None, &CancellationToken::new()).unwrap();
             assert_eq!(
                 plan.steps[0].args.iter().any(|arg| arg == "-Djacoco.skip=true"),
                 expected,
@@ -1078,7 +1236,7 @@ mod tests {
         write(&root, "core/pom.xml", "<project><artifactId>core</artifactId></project>");
         write(&root, "core/src/main/java/A.java", "class A {}");
         let model = crate::load(&root, &tmp.path().join("cache"), None);
-        let p = plan(&root, &model, BuildKind::Build, None, None).unwrap();
+        let p = plan(&root, &model, BuildKind::Build, None, None, None, &CancellationToken::new()).unwrap();
         assert_eq!(p.system, BuildSystem::Maven);
         assert_eq!(p.title, "demo");
         assert_eq!(p.steps.len(), 1);
@@ -1086,7 +1244,16 @@ mod tests {
             p.steps[0].args,
             ["-B", "-Dstyle.color=never", maven::LOCAL_REPO_TRACKING_ARG, "-Djacoco.skip=true", "test-compile"]
         );
-        let p = plan(&root, &model, BuildKind::Rebuild, Some(&root.join("core/src/main/java/A.java")), None).unwrap();
+        let p = plan(
+            &root,
+            &model,
+            BuildKind::Rebuild,
+            Some(&root.join("core/src/main/java/A.java")),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(
             p.steps[0].args,
             [
@@ -1108,24 +1275,36 @@ mod tests {
         write(&g, "settings.gradle", "include 'app'");
         write(&g, "app/build.gradle", "apply plugin: 'java'");
         let model = crate::load(&g, &tmp.path().join("cache2"), None);
-        let p = plan(&g, &model, BuildKind::Build, Some(&g.join("app/src/A.java")), None).unwrap();
+        let p =
+            plan(&g, &model, BuildKind::Build, Some(&g.join("app/src/A.java")), None, None, &CancellationToken::new())
+                .unwrap();
         assert_eq!(p.system, BuildSystem::Gradle);
         assert_eq!(p.steps[0].args, ["--console=plain", ":app:classes", ":app:testClasses"]);
         assert_eq!(
-            plan(&g, &model, BuildKind::Artifacts, None, None).unwrap().steps[0].args,
+            plan(&g, &model, BuildKind::Artifacts, None, None, None, &CancellationToken::new()).unwrap().steps[0].args,
             ["--console=plain", "assemble"]
         );
 
         let c = tmp.path().join("c");
         write(&c, "Cargo.toml", "[package]\nname='c'");
-        let p = plan(&c, &BuildModel::default(), BuildKind::Rebuild, None, None).unwrap();
+        let p =
+            plan(&c, &BuildModel::default(), BuildKind::Rebuild, None, None, None, &CancellationToken::new()).unwrap();
         assert_eq!(p.system, BuildSystem::Cargo);
         assert_eq!(p.steps.len(), 2);
         assert_eq!(p.steps[0].args[0], "clean");
 
         let go = tmp.path().join("go");
         write(&go, "go.mod", "module x");
-        let p = plan(&go, &BuildModel::default(), BuildKind::Build, Some(&go.join("pkg/a/a.go")), None).unwrap();
+        let p = plan(
+            &go,
+            &BuildModel::default(),
+            BuildKind::Build,
+            Some(&go.join("pkg/a/a.go")),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(p.steps[0].args, ["build", "./pkg/a/..."]);
         assert_eq!(p.steps[0].cwd, go);
 
@@ -1133,18 +1312,49 @@ mod tests {
         write(&ts, "package.json", r#"{"scripts":{"build":"vite build"}}"#);
         write(&ts, "tsconfig.json", "{}");
         write(&ts, "pnpm-lock.yaml", "");
-        let p = plan(&ts, &BuildModel::default(), BuildKind::Build, None, None).unwrap();
+        let p =
+            plan(&ts, &BuildModel::default(), BuildKind::Build, None, None, None, &CancellationToken::new()).unwrap();
         assert_eq!(p.steps[0].args, ["--noEmit", "--pretty", "false", "-p", "."]);
-        let p = plan(&ts, &BuildModel::default(), BuildKind::Artifacts, None, None).unwrap();
+        let p = plan(&ts, &BuildModel::default(), BuildKind::Artifacts, None, None, None, &CancellationToken::new())
+            .unwrap();
         assert_eq!(
             (p.steps[0].program.as_str(), p.steps[0].args.as_slice()),
             ("pnpm", &["run".to_owned(), "build".to_owned()][..])
         );
 
+        // .NET: the solution, else the project; a module build is the file's project. An ASP.NET
+        // project's package.json (its front end) doesn't make it a TypeScript build.
+        let net = tmp.path().join("net");
+        write(&net, "App.sln", "");
+        write(&net, "src/Api/Api.csproj", "<Project/>");
+        write(&net, "src/Api/package.json", "{}");
+        write(&net, "src/Api/Program.cs", "");
+        let p =
+            plan(&net, &BuildModel::default(), BuildKind::Build, None, None, None, &CancellationToken::new()).unwrap();
+        assert_eq!(p.system, BuildSystem::Dotnet);
+        assert_eq!(p.steps[0].args, ["build", "App.sln", "-nologo", "-clp:NoSummary"]);
+        assert_eq!(p.steps[0].env["MSBUILDTERMINALLOGGER"], "off");
+        let p = plan(
+            &net,
+            &BuildModel::default(),
+            BuildKind::Rebuild,
+            Some(&net.join("src/Api/Program.cs")),
+            None,
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
+        assert_eq!(p.steps[0].args, ["build", "Api.csproj", "-nologo", "-clp:NoSummary", "--no-incremental"]);
+        assert_eq!(p.steps[0].cwd, net.join("src/Api"));
+        let p = plan(&net, &BuildModel::default(), BuildKind::Artifacts, None, None, None, &CancellationToken::new())
+            .unwrap();
+        assert_eq!(p.steps[0].args[0], "publish");
+
         let cm = tmp.path().join("cm");
         write(&cm, "CMakeLists.txt", "project(app)");
         let args = |p: &BuildPlan| p.steps.iter().map(|s| s.args.join(" ")).collect::<Vec<_>>();
-        let p = plan(&cm, &BuildModel::default(), BuildKind::Build, None, None).unwrap();
+        let p =
+            plan(&cm, &BuildModel::default(), BuildKind::Build, None, None, None, &CancellationToken::new()).unwrap();
         assert_eq!(p.system, BuildSystem::CMake);
         assert_eq!(
             args(&p),
@@ -1155,7 +1365,8 @@ mod tests {
             "an unconfigured project is configured first"
         );
         write(&cm, "cmake-build-release/CMakeCache.txt", "");
-        let p = plan(&cm, &BuildModel::default(), BuildKind::Rebuild, None, None).unwrap();
+        let p =
+            plan(&cm, &BuildModel::default(), BuildKind::Rebuild, None, None, None, &CancellationToken::new()).unwrap();
         assert_eq!(
             args(&p),
             ["--build cmake-build-release --config Debug --clean-first"],
@@ -1167,17 +1378,34 @@ mod tests {
             build_args: vec!["-j".into(), "8".into()],
             ..CMakeProfile::default()
         };
-        let p =
-            plan(&cm, &BuildModel::default(), BuildKind::Build, None, Some(std::slice::from_ref(&profile))).unwrap();
+        let p = plan(
+            &cm,
+            &BuildModel::default(),
+            BuildKind::Build,
+            None,
+            Some(std::slice::from_ref(&profile)),
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(args(&p), ["--build cmake-build-release --config Release -j 8"]);
-        let p = plan(&cm, &BuildModel::default(), BuildKind::Build, None, Some(&[CMakeProfile::default()])).unwrap();
+        let p = plan(
+            &cm,
+            &BuildModel::default(),
+            BuildKind::Build,
+            None,
+            Some(&[CMakeProfile::default()]),
+            None,
+            &CancellationToken::new(),
+        )
+        .unwrap();
         assert_eq!(p.steps[0].args[..4], ["-S", ".", "-B", "cmake-build-debug"]);
 
         let siblings = tmp.path().join("siblings");
         write(&siblings, "core/pom.xml", "<project><artifactId>core</artifactId></project>");
         write(&siblings, "system/pom.xml", "<project><artifactId>system</artifactId></project>");
         let model = crate::load(&siblings, &tmp.path().join("cache3"), None);
-        let p = plan(&siblings, &model, BuildKind::Build, None, None).unwrap();
+        let p = plan(&siblings, &model, BuildKind::Build, None, None, None, &CancellationToken::new()).unwrap();
         assert_eq!(p.system, BuildSystem::Maven);
         assert_eq!(
             p.steps.iter().map(|s| s.cwd.clone()).collect::<Vec<_>>(),
@@ -1186,7 +1414,9 @@ mod tests {
 
         let none = tmp.path().join("none");
         std::fs::create_dir_all(&none).unwrap();
-        assert!(plan(&none, &BuildModel::default(), BuildKind::Build, None, None).is_err());
+        assert!(
+            plan(&none, &BuildModel::default(), BuildKind::Build, None, None, None, &CancellationToken::new()).is_err()
+        );
     }
 
     #[test]
@@ -1198,6 +1428,22 @@ mod tests {
         assert_eq!(utf16_col(Some("ab"), 5, ColUnit::Char), 4);
         assert_eq!(identifier_len("x 😀ab_1 c", 2), 0);
         assert_eq!(identifier_len("x é_1 c", 2), 3);
+    }
+
+    #[test]
+    fn resolves_a_member_build_s_workspace_relative_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().to_path_buf();
+        write(&root, "client/src/main.rs", "fn main() {}\n");
+        write(&root, "client/src/lib.rs", "\n");
+        write(&root, "src/lib.rs", "\n");
+        let map = PathMap { root: root.clone(), canonical: None };
+        let member = root.join("client");
+        let base = member.to_str();
+        // Build Module runs in the member; rustc names its files from the workspace root.
+        assert_eq!(map.resolve("client/src/main.rs", &member, base), root.join("client/src/main.rs"));
+        // A crate built from its own directory names them from there.
+        assert_eq!(map.resolve("src/lib.rs", &member, base), member.join("src/lib.rs"));
     }
 
     // Uses Unix absolute paths for the canonical root.
@@ -1369,7 +1615,8 @@ mod tests {
         let model = reactor_model();
         for (test, goal) in [(false, "compile"), (true, "test-compile")] {
             // A normal launch is incremental: no `clean` (IDEA's Make, not Rebuild).
-            let plan = launch_plan(root, &model, &root.join("app"), test, BuildKind::Build).unwrap();
+            let plan = launch_plan(root, &model, &root.join("app"), test, BuildKind::Build, &CancellationToken::new())
+                .unwrap();
             let step = &plan.steps[0];
             assert_eq!(step.cwd, root);
             assert_eq!(step.program, "mvnw");
@@ -1390,7 +1637,9 @@ mod tests {
                 ]
             );
             // Rebuild cleans first, as IDEA's Rebuild does.
-            let plan = launch_plan(root, &model, &root.join("app"), test, BuildKind::Rebuild).unwrap();
+            let plan =
+                launch_plan(root, &model, &root.join("app"), test, BuildKind::Rebuild, &CancellationToken::new())
+                    .unwrap();
             assert_eq!(
                 plan.steps[0].args,
                 [

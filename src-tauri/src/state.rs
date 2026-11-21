@@ -19,8 +19,6 @@ pub struct AppState {
     pub recent: RecentProjects,
     /// Plugins (`ide_host::plugins`), shared by all windows.
     pub plugins: Arc<ide_host::plugins::PluginHost>,
-    /// Agents › MCP Server: built-in IDE tools for agents.
-    pub mcp: crate::commands::mcp::McpService,
     /// Credential prompts of `ssh` / `git` child processes (`None` if it failed to start).
     pub askpass: Option<ide_ssh::askpass::AskpassServer>,
     /// Remote development connections, by window label.
@@ -107,7 +105,6 @@ impl AppState {
             askpass: start_askpass(&app),
             sink: global_sink,
             plugins: crate::commands::plugin::create_host(&app, &data_dir, &host)?,
-            mcp: Default::default(),
             remote_dev: crate::remote_dev::Connections::default(),
             host,
             startup: Startup {
@@ -170,9 +167,16 @@ impl AppState {
         self.host.open_light(window, file)
     }
 
+    /// LightEdit without a file (File › New File from a welcome window).
+    pub fn open_light_empty(&self, window: &str) -> IdeResult<Arc<Project>> {
+        self.remote_dev.disconnect(window);
+        self.host.open_light_empty(window)
+    }
+
     /// Called on the event-loop thread (window destruction, the `close_project`
     /// command), so it must not wait for the project's workers to shut down.
     pub fn close_project(&self, window: &str) {
+        crate::system_notifications::clear_window(window);
         self.remote_dev.disconnect(window);
         self.host.close_project_detached(window);
     }

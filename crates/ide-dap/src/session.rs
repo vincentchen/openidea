@@ -17,7 +17,7 @@ use std::process::Stdio;
 use std::sync::Arc;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use tokio::io::{AsyncRead, AsyncReadExt};
 use tokio::process::Child;
 use tokio::sync::{mpsc, watch};
@@ -57,6 +57,8 @@ pub(crate) struct Session {
     pub job: Mutex<Option<ide_core::process::Job>>,
     /// Set once `configurationDone` was sent; breakpoint updates go out live after that.
     pub configured: AtomicBool,
+    /// Set once the adapter answered `launch` / `attach`, after the configuration.
+    pub launched: watch::Sender<bool>,
     pub initialized: watch::Sender<bool>,
     pub startup_cancel: ide_core::CancellationToken,
     pub output_drained: watch::Sender<bool>,
@@ -89,6 +91,14 @@ pub(crate) struct Session {
     progress: Mutex<HashMap<String, TaskId>>,
     /// Relay between a Kotlin adapter and its JVM. Dropping it closes both sockets.
     pub jdwp_link: parking_lot::Mutex<Option<ide_jdwp::JdwpLink>>,
+    /// The `type` of the launch or attach request (js-debug's `pwa-node`, `pwa-chrome`); a child
+    /// session's comes from the configuration the adapter started it with.
+    pub launch_type: std::sync::OnceLock<String>,
+    /// The response rules of a page once a connection applies them (`js_cdp::serve`).
+    /// Dropped with the session, which switches the browser's interception off.
+    pub js_overrides: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Vec<crate::JsResponseRule>>>>,
+    /// The file js-debug records the page's CPU profile into, while one is being recorded.
+    pub js_profile: parking_lot::Mutex<Option<std::path::PathBuf>>,
     pub jvm_inspector: parking_lot::Mutex<Option<Arc<dyn ide_jvm_inspect::JvmInspector>>>,
     /// One inspector request per session at a time.
     pub inspect_lock: tokio::sync::Mutex<()>,
@@ -104,8 +114,13 @@ pub(crate) struct Session {
     pub jvm_located: watch::Sender<bool>,
     pub kotlin_mirror: Mutex<Option<crate::kotlin::SourceMirror>>,
     pub jvm_memory: tokio::sync::Mutex<crate::JvmMemoryState>,
+    pub stream_tracer: parking_lot::Mutex<Option<Arc<dyn ide_jvm_inspect::StreamTracer>>>,
+    pub(crate) stream_trace: parking_lot::Mutex<Option<crate::stream_trace::ActiveTrace>>,
+    /// The last trace that finished, until the stop its records were read in ends.
+    pub(crate) stream_trace_done: parking_lot::Mutex<Option<crate::stream_trace::DoneTrace>>,
     /// Used only by a kotlin-lsp session: see [`Session::kotlin_lsp_quirks`].
     pub(crate) quirks: kotlin_lsp::Quirks,
+    pub(crate) unity_startup_activity: Mutex<Instant>,
 }
 
 /// Which threads of the program are suspended: each from its `stopped` event until a
@@ -184,6 +199,13 @@ impl Suspension {
         self.0.lock().ticket
     }
 
+    /// The ticket of a stop of `thread` (its own or every thread's) taken after ticket `after`.
+    pub fn stopped_since(&self, thread: i64, after: u64) -> Option<u64> {
+        let stops = self.0.lock();
+        let own = stops.threads.iter().find(|&&(id, _)| id == thread).map(|&(_, ticket)| ticket);
+        own.max(stops.all).filter(|&ticket| ticket > after)
+    }
+
     /// After a successful resume-like request for `thread`; `all`: every thread ran.
     pub fn resumed(&self, ticket: u64, thread: i64, all: bool) {
         self.0.lock().release(Some(thread), all, ticket);
@@ -230,6 +252,7 @@ impl Session {
             #[cfg(windows)]
             job: Mutex::new(job),
             configured: AtomicBool::new(false),
+            launched: watch::channel(false).0,
             initialized: watch::channel(false).0,
             startup_cancel: ide_core::CancellationToken::new(),
             output_drained: watch::channel(true).0,
@@ -248,6 +271,9 @@ impl Session {
             resolved_paths: Mutex::new(HashMap::new()),
             progress: Mutex::new(HashMap::new()),
             jdwp_link: parking_lot::Mutex::new(None),
+            launch_type: std::sync::OnceLock::new(),
+            js_overrides: tokio::sync::Mutex::new(None),
+            js_profile: parking_lot::Mutex::new(None),
             jvm_inspector: parking_lot::Mutex::new(None),
             inspect_lock: tokio::sync::Mutex::default(),
             ended: ide_core::CancellationToken::new(),
@@ -255,7 +281,11 @@ impl Session {
             jvm_located: watch::channel(false).0,
             kotlin_mirror: Mutex::new(None),
             jvm_memory: tokio::sync::Mutex::default(),
+            stream_tracer: parking_lot::Mutex::new(None),
+            stream_trace: parking_lot::Mutex::new(None),
+            stream_trace_done: parking_lot::Mutex::new(None),
             quirks: kotlin_lsp::Quirks::default(),
+            unity_startup_activity: Mutex::new(Instant::now()),
         }
     }
 
@@ -467,16 +497,16 @@ impl Session {
             let _ = c.start_kill();
         }
         if let Some(mut program) = self.program.lock().take() {
-            let _ = program.child.kill();
-            let _ = std::thread::Builder::new().name("openidea-debug-reap".into()).spawn(move || {
-                let _ = program.child.wait();
-            });
+            program.kill();
         }
     }
 }
 
 /// How long Stop waits for a launched program to exit before reporting the session ended.
 pub(crate) const DEBUGGEE_EXIT_WAIT: Duration = Duration::from_secs(10);
+/// How long a stop waits for a killed program to be gone (Windows ends processes asynchronously).
+#[cfg(windows)]
+const DEBUGGEE_KILL_WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) async fn remember_debuggee(s: &Arc<Session>) {
     #[cfg(windows)]
@@ -567,7 +597,7 @@ fn launch_groups(s: &Session) -> Vec<libc::pid_t> {
     for child in s.debuggees.lock().iter() {
         push(child.id());
     }
-    push(s.program.lock().as_ref().and_then(|p| p.child.process_id()));
+    push(s.program.lock().as_ref().and_then(ProgramTerminal::process_id));
     groups.retain(|g| *g > 0);
     groups
 }
@@ -616,14 +646,24 @@ pub(crate) async fn wait_for_debuggee(s: &Arc<Session>, terminate: bool) {
     }
     #[cfg(windows)]
     {
+        use std::time::Instant;
         remember_debuggee(s).await;
-        let deadline = std::time::Instant::now() + DEBUGGEE_EXIT_WAIT;
+        let deadline = Instant::now() + DEBUGGEE_EXIT_WAIT;
+        let mut killed: Option<Instant> = None;
         // The captured tree is the oracle when it was captured; otherwise the job (every
         // process the launch started) is, so a failed capture can no longer end the wait
         // while the program still holds its port.
         while launch_running(s) {
-            if s.stop_force.swap(false, Ordering::AcqRel) || std::time::Instant::now() >= deadline {
+            let now = Instant::now();
+            if s.stop_force.swap(false, Ordering::AcqRel) || (killed.is_none() && now >= deadline) {
                 signal_debuggee(s, true).await;
+                killed.get_or_insert(now);
+            }
+            // Termination is asynchronous, and a process TerminateProcess can't end (stuck in
+            // the kernel) would hold the stop forever: give up on it, as on Unix.
+            if killed.is_some_and(|at| now.duration_since(at) >= DEBUGGEE_KILL_WAIT) {
+                tracing::warn!(session = s.id.0, pid, "stop: the debugged program did not exit after it was killed");
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -705,6 +745,15 @@ pub(crate) async fn event_loop(
 }
 
 async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut body: Value) {
+    if s.adapter == "unity"
+        && event == "output"
+        && body
+            .get("output")
+            .and_then(Value::as_str)
+            .is_some_and(|text| text.starts_with("Loaded assembly:") || text.starts_with("Resolved pending breakpoint"))
+    {
+        *s.unity_startup_activity.lock() = Instant::now();
+    }
     if let Some(mirror) = s.kotlin_mirror.lock().as_ref() {
         mirror.translate(&mut body);
     }
@@ -713,10 +762,15 @@ async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut bo
     match event {
         "initialized" => {
             s.initialized.send_replace(true);
-            s.emit(DebugEvent::Initialized);
+            if s.adapter != "unity" {
+                s.emit(DebugEvent::Initialized);
+            }
         }
         "stopped" => {
             let all = body.get("allThreadsStopped").and_then(Value::as_bool).unwrap_or(false);
+            if crate::stream_trace::resume_traced_stop(s, int("threadId"), all) {
+                return;
+            }
             s.suspended.stopped(int("threadId"), all);
             let mut reason = str_("reason").unwrap_or_else(|| "pause".into());
             if let Some(quirks) = s.kotlin_lsp_quirks() {
@@ -736,6 +790,7 @@ async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut bo
             // DAP: an event without the flag continues its thread alone. The UI keeps treating
             // it as all threads; the suspension, which holds only threads that stopped, need not.
             s.suspended.continued(int("threadId"), all.unwrap_or(false));
+            crate::stream_trace::release_done(s);
             s.emit(DebugEvent::Continued {
                 thread_id: int("threadId").unwrap_or(0),
                 all_threads_continued: all.unwrap_or(true),
@@ -824,6 +879,7 @@ async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut bo
             change_type: crate::hot_code_replace_type(body.get("changeType")),
             message: str_("message").unwrap_or_default(),
         }),
+        "flutter.appStarted" => s.emit(DebugEvent::FlutterAppStarted),
         // Sent only by adapters told `supportsInvalidatedEvent` (kotlin-lsp).
         "invalidated" => s.emit(DebugEvent::Invalidated {
             areas: body
@@ -832,6 +888,16 @@ async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut bo
                 .map(|a| a.iter().filter_map(Value::as_str).map(str::to_owned).collect())
                 .unwrap_or_default(),
         }),
+        // js-debug, after `enableNetworking`.
+        "networkEvent" => {
+            if let Some(event) = crate::js_debug::network_event(&body) {
+                s.emit(DebugEvent::JsNetwork { event });
+            }
+        }
+        // js-debug, after `startProfile`: where it records the profile.
+        "profileStarted" => {
+            *s.js_profile.lock() = str_("file").map(std::path::PathBuf::from);
+        }
         _ => tracing::trace!("dap: ignored event {event}"),
     }
 }
@@ -860,8 +926,12 @@ fn on_reverse_request(mgr: &Arc<DebugManager>, s: &Arc<Session>, seq: i64, comma
 
 /// A `runInTerminal` program and the pseudo-terminal it runs in.
 pub(crate) struct ProgramTerminal {
-    writer: ide_core::input::InputWriter,
-    child: Box<dyn portable_pty::Child + Send + Sync>,
+    writer: Arc<ide_core::input::InputWriter>,
+    killer: Box<dyn portable_pty::ChildKiller + Send + Sync>,
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pid: Option<u32>,
+    /// Set once the program has exited and been reaped.
+    exited: Arc<AtomicBool>,
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
 
@@ -869,6 +939,29 @@ impl ProgramTerminal {
     pub(crate) fn write(&mut self, text: &str) -> std::io::Result<()> {
         self.writer.write(text.as_bytes())
     }
+
+    /// The program's process id while it runs.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    pub(crate) fn process_id(&self) -> Option<u32> {
+        if self.exited.load(Ordering::Acquire) { None } else { self.pid }
+    }
+
+    pub(crate) fn kill(&mut self) {
+        // After the reap the pid may belong to another process.
+        if !self.exited.load(Ordering::Acquire) {
+            let _ = self.killer.kill();
+        }
+    }
+}
+
+/// Reaps the program as soon as it exits. Until then it stays a zombie that `kill(pid, 0)` still
+/// finds: js-debug polls the `processId` it was given and keeps the session (and its terminal)
+/// open while that process looks alive, and Stop would wait for it as for a running program.
+fn reap_on_exit(mut child: Box<dyn portable_pty::Child + Send + Sync>, exited: Arc<AtomicBool>) {
+    let _ = std::thread::Builder::new().name("openidea-debug-reap".into()).spawn(move || {
+        let _ = child.wait();
+        exited.store(true, Ordering::Release);
+    });
 }
 
 /// `runInTerminal`: starts the debuggee on a pseudo-terminal, as an IDE terminal would (CodeLLDB
@@ -900,20 +993,18 @@ pub(crate) fn run_in_terminal(s: &Arc<Session>, args: &Value) -> Result<Value, S
     let mut cmd = CommandBuilder::new(program);
     // CodeLLDB's launcher clears the terminal first; the console keeps the session's earlier output.
     cmd.args(rest.iter().filter(|a| *a != "--clear-screen"));
-    for (k, v) in ide_core::process::host_env_fixes() {
+    let cwd = args.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()).map_or(s.spec.cwd.as_path(), Path::new);
+    for (k, v) in ide_core::process::host_env_fixes_in(cwd) {
         match v {
             Some(v) => cmd.env(k, v),
             None => cmd.env_remove(k),
         }
     }
-    for (k, v) in ide_core::process::shell_env() {
+    for (k, v) in ide_core::process::shell_env_in(cwd) {
         cmd.env(k, v);
     }
     cmd.env("TERM", "xterm-256color");
-    match args.get("cwd").and_then(Value::as_str).filter(|c| !c.is_empty()) {
-        Some(cwd) => cmd.cwd(cwd),
-        None => cmd.cwd(&s.spec.cwd),
-    }
+    cmd.cwd(cwd);
     if let Some(env) = args.get("env").and_then(Value::as_object) {
         for (k, v) in env {
             match v.as_str() {
@@ -948,24 +1039,55 @@ pub(crate) fn run_in_terminal(s: &Arc<Session>, args: &Value) -> Result<Value, S
         let _ = child.wait();
     })
     .map_err(|e| format!("terminal input worker: {e}"))?;
+    let writer = Arc::new(writer);
     let pid = child.process_id();
     forward_terminal_output(
         s,
         reader,
+        writer.clone(),
         #[cfg(unix)]
         wait_readable,
     );
-    if let Some(mut previous) = s.program.lock().replace(ProgramTerminal { writer, child, _master: pair.master }) {
-        let _ = previous.child.kill();
+    let killer = child.clone_killer();
+    let exited = Arc::new(AtomicBool::new(false));
+    reap_on_exit(child, exited.clone());
+    let program = ProgramTerminal { writer, killer, pid, exited, _master: pair.master };
+    if let Some(mut previous) = s.program.lock().replace(program) {
+        previous.kill();
     }
     s.owner.sink.emit(IdeEvent::Debug { session: s.id, event: DebugEvent::ProgramInput });
     Ok(json!({ "processId": pid }))
 }
 
-/// The program's terminal output, as stdout lines (`\r\n` as `\n`; colours are kept).
+/// A terminal's cursor position query (DSR). ConPTY sends one when it starts and runs the program
+/// only once the terminal answers; programs that lay out a prompt ask it too.
+const CURSOR_QUERY: &[u8] = b"\x1b[6n";
+
+/// `chunk` without its cursor position queries, and how many there were.
+pub(crate) fn take_cursor_queries(chunk: &[u8]) -> (Vec<u8>, usize) {
+    let mut out = Vec::with_capacity(chunk.len());
+    let mut queries = 0;
+    let mut rest = chunk;
+    while let Some(at) = rest.windows(CURSOR_QUERY.len()).position(|w| w == CURSOR_QUERY) {
+        out.extend_from_slice(&rest[..at]);
+        rest = &rest[at + CURSOR_QUERY.len()..];
+        queries += 1;
+    }
+    out.extend_from_slice(rest);
+    (out, queries)
+}
+
+/// Length of the end of `pending` that may begin a cursor position query the next read completes.
+pub(crate) fn partial_cursor_query(pending: &[u8]) -> usize {
+    (1..CURSOR_QUERY.len()).rev().find(|&n| pending.ends_with(&CURSOR_QUERY[..n])).unwrap_or(0)
+}
+
+/// The program's terminal output, as stdout lines (`\r\n` as `\n`; colours are kept). The debug
+/// console is no terminal, so cursor position queries are answered here (top-left corner).
 fn forward_terminal_output(
     s: &Session,
     mut reader: Box<dyn std::io::Read + Send>,
+    answer: Arc<ide_core::input::InputWriter>,
     #[cfg(unix)] mut wait_readable: impl FnMut() -> std::io::Result<()> + Send + 'static,
 ) {
     let session = s.id;
@@ -997,11 +1119,20 @@ fn forward_terminal_output(
                     break;
                 }
             }
-            // Keep incomplete UTF-8 sequences, and a `\r` that may start a `\r\n`, for the next chunk.
-            let mut valid = match std::str::from_utf8(&pending) {
-                Ok(_) => pending.len(),
+            let (rest, queries) = take_cursor_queries(&pending);
+            pending = rest;
+            for _ in 0..queries {
+                if let Err(e) = answer.write(b"\x1b[1;1R") {
+                    tracing::warn!(%session, "debug terminal cursor position: {e}");
+                }
+            }
+            // Keep incomplete UTF-8 sequences, a `\r` that may start a `\r\n`, and the start of
+            // a cursor position query for the next chunk.
+            let keep = partial_cursor_query(&pending);
+            let mut valid = match std::str::from_utf8(&pending[..pending.len() - keep]) {
+                Ok(_) => pending.len() - keep,
                 Err(e) if e.error_len().is_none() => e.valid_up_to(),
-                Err(_) => pending.len(),
+                Err(_) => pending.len() - keep,
             };
             if valid > 0 && pending[valid - 1] == b'\r' {
                 valid -= 1;
@@ -1080,6 +1211,7 @@ pub(crate) async fn start_kotlin_debuggee(s: &Arc<Session>, args: &mut Value) ->
     let classpath =
         std::env::join_paths(strings("classPaths")).map_err(|e| ide_core::IdeError::invalid(e.to_string()))?;
     let mut cmd = tokio::process::Command::new(java);
+    cmd.current_dir(&s.spec.cwd);
     ide_core::process::prepare(cmd.as_std_mut());
     cmd.args(kotlin_jvm_args(strings("vmArguments"), cfg!(windows)))
         // Let the JVM pick its own port (`:0`) and report it below: pre-picking a free
@@ -1098,8 +1230,7 @@ pub(crate) async fn start_kotlin_debuggee(s: &Arc<Session>, args: &mut Value) ->
             .ok_or_else(|| ide_core::IdeError::invalid("Missing Kotlin main class"))?,
     )
     .args(strings("programArgs"))
-    .current_dir(&s.spec.cwd)
-    .envs(ide_core::process::shell_env())
+    .envs(ide_core::process::shell_env_in(&s.spec.cwd))
     .stdin(Stdio::null())
     .stdout(Stdio::piped())
     .stderr(Stdio::piped())
@@ -1324,5 +1455,30 @@ mod tests {
         assert_eq!(parse_jdwp_port("Listening for transport dt_socket at address: 127.0.0.1:51234"), Some(51234));
         assert_eq!(parse_jdwp_port("Listening for transport dt_socket at address: [::1]:51234"), Some(51234));
         assert_eq!(parse_jdwp_port("unrelated output"), None);
+    }
+
+    /// js-debug polls the `runInTerminal` pid with `kill(pid, 0)`; an unreaped zombie answers it as
+    /// a live process and keeps the session open after the program ends.
+    #[cfg(unix)]
+    #[test]
+    fn a_terminal_program_is_reaped_when_it_exits() {
+        use portable_pty::{CommandBuilder, PtySize, native_pty_system};
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let pair =
+            native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).unwrap();
+        let mut cmd = CommandBuilder::new("/bin/sh");
+        cmd.args(["-c", "exit 0"]);
+        let child = pair.slave.spawn_command(cmd).unwrap();
+        let pid = child.process_id().unwrap() as libc::pid_t;
+        let exited = Arc::new(AtomicBool::new(false));
+        super::reap_on_exit(child, exited.clone());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !exited.load(Ordering::Acquire) {
+            assert!(std::time::Instant::now() < deadline, "program was not reaped");
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        // SAFETY: signal 0 only checks whether the process exists.
+        assert_eq!(unsafe { libc::kill(pid, 0) }, -1);
     }
 }

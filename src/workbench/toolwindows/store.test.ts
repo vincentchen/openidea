@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { getContext } from "@/platform/context";
+import { useProject } from "@/platform/project";
 import { actionToggled, executeAction, getAction } from "@/platform/actions";
 import { registerToolWindow } from "../contributions";
 import { installToolWindowActions } from "./actions";
 import {
   activateToolWindow,
+  applyToolWindowLayout,
+  collapseSidesForNarrowWindow,
+  enterDistractionFreeLayout,
+  exitDistractionFreeLayout,
+  toolWindowLayoutSnapshot,
+  restoreSidesAfterNarrowWindow,
   hideActiveToolWindow,
   hideAllToolWindows,
   hideToolWindow,
@@ -237,6 +244,21 @@ describe("tool window persistence", () => {
 });
 
 describe("tool window actions", () => {
+  it("titles Hide All Tool Windows 'Restore Tool Windows' while it would restore them", async () => {
+    const dispose = installToolWindowActions();
+    try {
+      showToolWindow("terminal");
+      expect(getAction("toolwindow.hideAll")?.title).toBe("Hide All Tool Windows");
+      await executeAction("toolwindow.hideAll");
+      expect(getAction("toolwindow.hideAll")?.title).toBe("Restore Tool Windows");
+      await executeAction("toolwindow.hideAll");
+      expect(isToolWindowVisible("terminal")).toBe(true);
+      expect(getAction("toolwindow.hideAll")?.title).toBe("Hide All Tool Windows");
+    } finally {
+      dispose();
+    }
+  });
+
   it("registers toolwindow.<id> and generic actions", async () => {
     const dispose = installToolWindowActions();
     expect(getAction("toolwindow.terminal")?.title).toBe("Terminal");
@@ -470,6 +492,19 @@ describe("stripe buttons", () => {
     resetToolWindowPlacements();
     expect(buttons()).toEqual({});
   });
+
+  it("drops the button of a window that lost its last tab until new content opens it", () => {
+    disposers.push(registerToolWindow(find));
+    showToolWindow("find");
+    toolWindowServiceImpl.hide("find");
+    expect(hasStripeButton(find, buttons())).toBe(true);
+    showToolWindow("find");
+    toolWindowServiceImpl.hide("find", { removeFromStripe: true });
+    expect(isToolWindowVisible("find")).toBe(false);
+    expect(hasStripeButton(find, buttons())).toBe(false);
+    showToolWindow("find");
+    expect(hasStripeButton(find, buttons())).toBe(true);
+  });
 });
 
 describe("view modes", () => {
@@ -538,5 +573,143 @@ describe("view modes", () => {
     await executeAction("toolwindow.viewMode.dockPinned", "terminal");
     expect(useToolWindowLayout.getState().viewModes).toEqual({ project: "dockUnpinned" });
     dispose();
+  });
+});
+
+describe("narrow window", () => {
+  const saved = () => JSON.parse(localStorage.getItem("openidea.layout.v1:/work/a") ?? "{}").visible;
+
+  it("hides the side windows, keeps the bottom one, and puts the sides back", () => {
+    showToolWindow("terminal");
+    collapseSidesForNarrowWindow();
+    expect(isToolWindowVisible("project")).toBe(false);
+    expect(isToolWindowVisible("terminal")).toBe(true);
+    expect(useToolWindowLayout.getState().stripeButtons.project).not.toBe(false);
+    restoreSidesAfterNarrowWindow();
+    expect(isToolWindowVisible("project")).toBe(true);
+    expect(isToolWindowVisible("terminal")).toBe(true);
+    expect(useToolWindowLayout.getState().narrowStash).toBeNull();
+  });
+
+  it("reopens a window from its stripe button while narrow", () => {
+    collapseSidesForNarrowWindow();
+    toggleToolWindow("project");
+    expect(isToolWindowVisible("project")).toBe(true);
+  });
+
+  it("does not save the collapse, but does save changes made meanwhile", () => {
+    showToolWindow("terminal");
+    collapseSidesForNarrowWindow();
+    expect(saved().left).toBe("project");
+    showToolWindow("problems");
+    expect(saved()).toMatchObject({ left: "project", bottom: "problems" });
+  });
+
+  it("keeps a side window the user opened while narrow over the remembered one", () => {
+    collapseSidesForNarrowWindow();
+    showToolWindow("structure");
+    restoreSidesAfterNarrowWindow();
+    expect(isToolWindowVisible("structure")).toBe(true);
+    expect(isToolWindowVisible("project")).toBe(false);
+  });
+
+  it("collapses once, ignores a layout without sides or a project, and clears a maximized side", () => {
+    toggleMaximizeToolWindow("project");
+    collapseSidesForNarrowWindow();
+    const stash = useToolWindowLayout.getState().narrowStash;
+    expect(useToolWindowLayout.getState().maximized).toBeNull();
+    collapseSidesForNarrowWindow();
+    expect(useToolWindowLayout.getState().narrowStash).toBe(stash);
+
+    resetToolWindowLayout();
+    collapseSidesForNarrowWindow();
+    expect(useToolWindowLayout.getState().narrowStash).toBeNull();
+    loadToolWindowLayout("/work/a");
+    hideToolWindow("project");
+    collapseSidesForNarrowWindow();
+    expect(useToolWindowLayout.getState().narrowStash).toBeNull();
+  });
+
+  it("saves what the user does to a side area while narrow, not the remembered window", () => {
+    collapseSidesForNarrowWindow();
+    toggleToolWindow("project");
+    hideToolWindow("project");
+    expect(saved().left).toBeNull();
+    expect(useToolWindowLayout.getState().narrowStash).toBeNull();
+    restoreSidesAfterNarrowWindow();
+    expect(isToolWindowVisible("project")).toBe(false);
+  });
+
+  it("keeps the hidden sides in the saved layout through Distraction Free Mode", () => {
+    collapseSidesForNarrowWindow();
+    enterDistractionFreeLayout();
+    expect(saved().left).toBe("project");
+    exitDistractionFreeLayout();
+    expect(saved().left).toBe("project");
+    restoreSidesAfterNarrowWindow();
+    expect(isToolWindowVisible("project")).toBe(true);
+  });
+
+  it("includes the hidden sides in a saved layout snapshot and drops them when a layout is applied", () => {
+    collapseSidesForNarrowWindow();
+    const snapshot = toolWindowLayoutSnapshot();
+    expect(snapshot.visible.left).toBe("project");
+    applyToolWindowLayout({ ...snapshot, visible: { ...snapshot.visible, left: "structure" } });
+    expect(useToolWindowLayout.getState().narrowStash).toBeNull();
+    restoreSidesAfterNarrowWindow();
+    expect(isToolWindowVisible("structure")).toBe(true);
+    expect(saved().left).toBe("structure");
+  });
+
+  it("forgets the hidden sides when another project's layout loads", () => {
+    collapseSidesForNarrowWindow();
+    loadToolWindowLayout("/work/b");
+    expect(useToolWindowLayout.getState().narrowStash).toBeNull();
+    expect(isToolWindowVisible("project")).toBe(true);
+    restoreSidesAfterNarrowWindow();
+    expect(isToolWindowVisible("project")).toBe(true);
+  });
+
+  it("leaves a maximized bottom window maximized", () => {
+    showToolWindow("terminal");
+    toggleMaximizeToolWindow("terminal");
+    collapseSidesForNarrowWindow();
+    expect(useToolWindowLayout.getState().maximized).toBe("bottom");
+    expect(isToolWindowVisible("terminal")).toBe(true);
+  });
+});
+
+describe("remember size for each tool window", () => {
+  const remember = (on: boolean) =>
+    useProject.setState({ settings: { appearance: { rememberToolWindowSizes: on } } } as never);
+  afterEach(() => remember(false));
+
+  it("restores each window's own size when switching on a side", () => {
+    remember(true);
+    showToolWindow("terminal");
+    setToolWindowSize("bottom", 200);
+    showToolWindow("problems");
+    setToolWindowSize("bottom", 400);
+    showToolWindow("terminal");
+    expect(useToolWindowLayout.getState().sizes.bottom).toBe(200);
+    showToolWindow("problems");
+    expect(useToolWindowLayout.getState().sizes.bottom).toBe(400);
+    // Kept after a hide, across a reload, and in a saved layout.
+    hideToolWindow("problems");
+    showToolWindow("terminal");
+    loadToolWindowLayout("/work/a");
+    showToolWindow("problems");
+    expect(useToolWindowLayout.getState().sizes.bottom).toBe(400);
+    expect(toolWindowLayoutSnapshot().windowSizes).toEqual({ terminal: 200, problems: 400 });
+  });
+
+  it("keeps one shared size per side when off", () => {
+    showToolWindow("terminal");
+    setToolWindowSize("bottom", 200);
+    showToolWindow("problems");
+    setToolWindowSize("bottom", 400);
+    showToolWindow("terminal");
+    expect(useToolWindowLayout.getState().sizes.bottom).toBe(400);
+    expect(useToolWindowLayout.getState().windowSizes).toEqual({});
   });
 });

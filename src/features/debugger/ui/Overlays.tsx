@@ -1,5 +1,14 @@
 /** Debugger popovers and dialogs: breakpoint properties, View Breakpoints, Evaluate, config chooser. */
-import { useEffect, useId, useMemo, useRef, useState, type KeyboardEvent, type MutableRefObject } from "react";
+import {
+  Fragment,
+  useEffect,
+  useId,
+  useMemo,
+  useRef,
+  useState,
+  type KeyboardEvent,
+  type MutableRefObject,
+} from "react";
 import { basename, relativePath, useProject } from "@/platform/project";
 import { executeAction, getAction } from "@/platform/actions";
 import { call, commands, type AttachableProcess, type RunConfig, type Variable } from "@/platform/ipc";
@@ -24,12 +33,17 @@ import {
   type SpecialBreakpoint,
 } from "../breakpoints/special";
 import { attachConfig, attachDetail, attachRows, type AttachRow } from "../attach";
+import { openAttachPopup, installAttachAdapter } from "../attachPopup";
 import {
   exceptionGroups,
+  filterHint,
   refreshExceptionFilters,
   setExceptionFilter,
   useExceptionBreakpoints,
 } from "../breakpoints/exceptions";
+import { EventBreakpointsSection } from "../js/EventBreakpointsSection";
+import { StreamChainChooser } from "../streams/StreamChainChooser";
+import { StreamAbortDialog } from "../streams/StreamAbortDialog";
 import { closeBreakpointPopover, useOverlays } from "./popoverStore";
 import { VariablesView, type VarRoot } from "./VariablesView";
 import { useExpressionCompletion } from "./ExpressionCompletion";
@@ -47,6 +61,8 @@ export function DebuggerOverlays() {
       <ConfigChooser />
       <AttachPopup />
       <SmartStepChooser />
+      <StreamChainChooser />
+      <StreamAbortDialog />
     </>
   );
 }
@@ -163,12 +179,19 @@ function BreakpointFields({
   const commitText = () => {
     const d = draft.current;
     const cond = d.condition.trim() || null;
-    if (cond) pushHistory("condition", cond);
-    updateBreakpoint(path, bp.id, {
+    const changes = {
       condition: cond,
       hitCondition: d.hitCondition.trim() || null,
       logMessage: d.logEval ? d.logMessage.trim() || null : null,
-    });
+    };
+    if (
+      changes.condition === (bp.condition ?? null) &&
+      changes.hitCondition === (bp.hitCondition ?? null) &&
+      changes.logMessage === (bp.logMessage ?? null)
+    )
+      return;
+    if (cond) pushHistory("condition", cond);
+    updateBreakpoint(path, bp.id, changes);
   };
   useEffect(() => {
     if (!commitRef) return;
@@ -380,9 +403,13 @@ function BreakpointsDialog() {
   }, [byFile, methods, fields]);
   const items = rows.filter((r) => r.type !== "section");
   const [selected, setSelected] = useState<string | null>(null);
+  // The shown breakpoint's typed fields, saved before it is closed or another one is shown:
+  // Enter on Done and a click on a row don't blur them.
+  const commitRef = useRef<(() => void) | null>(null);
   const open = !!state;
   const current = items.find((r) => r.key === (selected ?? state?.id)) ?? items[0];
   const close = () => {
+    commitRef.current?.();
     setSelected(null);
     useOverlays.setState({ breakpoints: null });
   };
@@ -432,8 +459,14 @@ function BreakpointsDialog() {
             isSection={(r) => r.type === "section"}
             renderSection={(r) => <div className={styles.exceptionAdapter}>{r.type === "section" ? r.label : ""}</div>}
             activeIndex={current ? rows.indexOf(current) : -1}
-            onActiveChange={(i) => setSelected(rows[i]?.key ?? null)}
-            onActivate={(r) => goTo(r)}
+            onActiveChange={(i) => {
+              commitRef.current?.();
+              setSelected(rows[i]?.key ?? null);
+            }}
+            // A click selects; double-click or Enter goes to the source.
+            onActivate={(r, _i, e) => {
+              if (e.type === "keydown" || e.detail > 1) goTo(r);
+            }}
             aria-label="All breakpoints"
             className={styles.bpList}
             empty={
@@ -502,12 +535,13 @@ function BreakpointsDialog() {
             }}
           />
           <ExceptionBreakpoints open={open} />
+          <EventBreakpointsSection />
         </div>
         <div className={styles.bpDetail}>
           {current?.type === "line" ? (
-            <BreakpointDetail key={current.key} row={current} onGo={() => goTo(current)} />
+            <BreakpointDetail key={current.key} row={current} onGo={() => goTo(current)} commitRef={commitRef} />
           ) : current?.type === "special" ? (
-            <SpecialDetail key={current.key} bp={current.bp} onGo={() => goTo(current)} />
+            <SpecialDetail key={current.key} bp={current.bp} onGo={() => goTo(current)} commitRef={commitRef} />
           ) : null}
         </div>
       </div>
@@ -542,13 +576,18 @@ function ExceptionBreakpoints({ open }: { open: boolean }) {
           >
             {groups.length > 1 && <div className={styles.exceptionAdapter}>{g.adapter}</div>}
             {g.filters.map((f) => (
-              <span key={f.filter} title={f.description ?? undefined} className={styles.exceptionRow}>
-                <Checkbox
-                  checked={f.enabled}
-                  onChange={(on) => setExceptionFilter(g.adapter, f.filter, on)}
-                  label={f.label}
-                />
-              </span>
+              <Fragment key={f.filter}>
+                <span title={f.description ?? undefined} className={styles.exceptionRow}>
+                  <Checkbox
+                    checked={f.enabled}
+                    onChange={(on) => setExceptionFilter(g.adapter, f.filter, on)}
+                    label={f.label}
+                  />
+                </span>
+                {filterHint(g.adapter, f.filter) && (
+                  <div className={styles.exceptionHint}>{tx(filterHint(g.adapter, f.filter)!)}</div>
+                )}
+              </Fragment>
             ))}
           </div>
         ))
@@ -557,7 +596,15 @@ function ExceptionBreakpoints({ open }: { open: boolean }) {
   );
 }
 
-function BreakpointDetail({ row, onGo }: { row: BpRow; onGo: () => void }) {
+function BreakpointDetail({
+  row,
+  onGo,
+  commitRef,
+}: {
+  row: BpRow;
+  onGo: () => void;
+  commitRef: MutableRefObject<(() => void) | null>;
+}) {
   const { path, bp } = row;
   const st = useBreakpoints((s) => s.status[bp.id]);
   return (
@@ -575,7 +622,7 @@ function BreakpointDetail({ row, onGo }: { row: BpRow; onGo: () => void }) {
         </Button>
       </div>
       {st && <div className={styles.statusLine}>{st.verified ? tx("Verified") : (st.message ?? "Not verified")}</div>}
-      <BreakpointFields path={path} bp={bp} />
+      <BreakpointFields path={path} bp={bp} commitRef={commitRef} />
       <Checkbox
         checked={!!bp.temporary}
         onChange={(temporary) => updateBreakpoint(path, bp.id, { temporary })}
@@ -585,11 +632,34 @@ function BreakpointDetail({ row, onGo }: { row: BpRow; onGo: () => void }) {
   );
 }
 
-function SpecialDetail({ bp, onGo }: { bp: SpecialBreakpoint; onGo: () => void }) {
+function SpecialDetail({
+  bp,
+  onGo,
+  commitRef,
+}: {
+  bp: SpecialBreakpoint;
+  onGo: () => void;
+  commitRef: MutableRefObject<(() => void) | null>;
+}) {
   const st = useSpecialBreakpoints((s) => s.status[bp.id]);
   const [name, setName] = useState(bp.kind === "method" ? bp.name : bp.label);
   const [condition, setCondition] = useState(bp.condition ?? "");
   const [hitCondition, setHitCondition] = useState(bp.hitCondition ?? "");
+  const draft = useRef({ name, condition, hitCondition });
+  useEffect(() => {
+    draft.current = { name, condition, hitCondition };
+    commitRef.current = () => {
+      const d = draft.current;
+      updateSpecial(bp.id, {
+        name: d.name.trim(),
+        condition: d.condition.trim() || null,
+        hitCondition: d.hitCondition.trim() || null,
+      });
+    };
+    return () => {
+      commitRef.current = null;
+    };
+  });
   return (
     <div className={styles.detail}>
       <div className={styles.bpTitle}>
@@ -898,6 +968,7 @@ function AttachPopup() {
   const root = useProject((s) => s.project?.root ?? null);
   const [filter, setFilter] = useState("");
   const [active, setActive] = useState(0);
+  const [installing, setInstalling] = useState(false);
   const rows = useMemo(() => attachRows(state?.processes ?? [], filter), [state?.processes, filter]);
   const firstItem = rows.findIndex((r) => r.kind === "process");
   const activeIndex = rows[active]?.kind === "process" ? active : firstItem;
@@ -908,10 +979,11 @@ function AttachPopup() {
     useOverlays.setState({ attach: null });
   };
   const attach = async (p: AttachableProcess) => {
+    if (state.projectRoot !== undefined && state.projectRoot !== root) return close();
     close();
     if (!root) return;
     try {
-      await startSession(await attachConfig(p, root), { rerunnable: false });
+      await startSession(await attachConfig(p, root), { rerunnable: false, runConfig: state.runConfig });
     } catch (e) {
       notifications().notify({
         group: "run",
@@ -931,8 +1003,44 @@ function AttachPopup() {
     }
   };
   return (
-    <Dialog open onClose={close} title="Attach to Process" width={640} position="top" aria-label="Attach to process">
+    <Dialog
+      open
+      onClose={close}
+      title={state.mode === "unity" ? "Attach to Unity Process" : "Attach to Process"}
+      width={640}
+      position="top"
+      aria-label={state.mode === "unity" ? "Attach to Unity Process" : "Attach to process"}
+      buttons={[
+        {
+          label: "Refresh",
+          role: "extra",
+          disabled: state.processes === null || installing,
+          onClick: () => {
+            setActive(0);
+            void openAttachPopup(state.mode, state.runConfig);
+          },
+        },
+        { label: "Cancel", role: "cancel", onClick: close },
+        {
+          label: "Attach",
+          role: "default",
+          disabled: rows[activeIndex]?.kind !== "process" || installing,
+          onClick: () => {
+            const row = rows[activeIndex];
+            if (row?.kind === "process") void attach(row.process);
+          },
+        },
+      ]}
+    >
       <div className={styles.evalBody}>
+        {state.mode === "unity" && (
+          <p>
+            <T>
+              Open the project in Unity Editor, enable Editor Attaching and switch to Debug Mode. Select its process
+              below. Stopping debugging disconnects without closing Unity.
+            </T>
+          </p>
+        )}
         <Input
           value={filter}
           onChange={(e) => {
@@ -958,7 +1066,20 @@ function AttachPopup() {
             <T>Loading processes…</T>
           </div>
         ) : state.error ? (
-          <div className={styles.empty}>{state.error}</div>
+          <div className={styles.empty}>
+            <div>{state.error}</div>
+            {state.installTool && (
+              <Button
+                disabled={installing}
+                onClick={() => {
+                  setInstalling(true);
+                  void installAttachAdapter().finally(() => setInstalling(false));
+                }}
+              >
+                {installing ? "Installing…" : "Install Unity Debugger"}
+              </Button>
+            )}
+          </div>
         ) : (
           <List<AttachRow>
             items={rows}
@@ -979,7 +1100,11 @@ function AttachPopup() {
             className={styles.attachList}
             empty={
               <div className={styles.empty}>
-                {filter ? tx`No attachable processes match the filter.` : tx`No attachable processes.`}
+                {filter
+                  ? tx`No attachable processes match the filter.`
+                  : state.mode === "unity"
+                    ? tx`No Unity Editor processes found. Open Unity Editor, then refresh.`
+                    : tx`No attachable processes.`}
               </div>
             }
             renderItem={(r) =>

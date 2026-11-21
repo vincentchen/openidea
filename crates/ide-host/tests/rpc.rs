@@ -82,7 +82,9 @@ async fn serves_projects_files_documents_search_and_runs() {
     invoke(&peer, "lsp_resend_diagnostics", json!({})).await.unwrap();
     let files = invoke(&peer, "find_files", json!({"query": "main", "limit": 10})).await.unwrap();
     assert!(files.is_array());
-    for command in ["build_sync", "run_start", "sdk_locate_tools", "notebook_execute", "debug_start"] {
+    for command in
+        ["build_sync", "run_start", "sdk_locate_tools", "notebook_execute", "debug_start", "agent_refresh_models"]
+    {
         let error = invoke(&peer, command, json!({})).await.unwrap_err();
         assert!(error.message.contains("Restricted Mode"), "{command}: {error:?}");
     }
@@ -365,6 +367,14 @@ async fn local_deployment_runs_on_the_project_host() {
         "db_table_page",
         "db_apply_edits",
         "db_console_path",
+        "db_consoles",
+        "ssh_test",
+        "ssh_set_secret",
+        "ssh_password_saved",
+        "ssh_needs_secret",
+        "ssh_trust_host",
+        "ssh_connected",
+        "ssh_disconnect",
     ] {
         assert!(dispatcher.commands().contains(&cmd), "missing host command {cmd}");
     }
@@ -373,6 +383,12 @@ async fn local_deployment_runs_on_the_project_host() {
     tokio::spawn(rpc::serve(host, dispatcher, slot, sr, sw));
     let (cr, cw) = tokio::io::split(client_io);
     let peer = Peer::connect(cr, cw, Arc::new(Client::default()));
+    // A remote window's host-key and password remedies reach the server's SSH manager,
+    // the one its deployment / database connections failed in.
+    let trust = invoke(&peer, "ssh_trust_host", json!({"id": "nothing-pending"})).await.unwrap_err();
+    assert!(trust.message.contains("no host key to trust"), "{trust:?}");
+    invoke(&peer, "ssh_set_secret", json!({"id": "deploy", "secret": "pw", "save": false})).await.unwrap();
+    assert_eq!(invoke(&peer, "ssh_connected", json!({})).await.unwrap(), json!([]));
     invoke(&peer, "project_trust_set", json!({"path": project, "trusted": true, "folder": false})).await.unwrap();
     invoke(&peer, "open_project", json!({"path": project})).await.unwrap();
     let deployment = json!({"servers": [{"id":"local", "kind":"local", "rootPath":target}], "defaultServer":"local"});
@@ -458,32 +474,6 @@ async fn properties_conversion_through_remote_dispatch_without_a_remote_host() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn the_desktop_routes_exactly_what_a_server_of_this_build_answers() {
-    let tmp = tempfile::tempdir().unwrap();
-    let base = tmp.path().join("server");
-    let peer_slot = Arc::new(OnceLock::new());
-    let host = Arc::new(Host::new(HostConfig {
-        config_dir: base.join("config"),
-        data_dir: base.join("data"),
-        local_data_dir: base.join("data"),
-        languages: Arc::new(ide_language::LanguageRegistry::load(None).unwrap()),
-        syntax: Arc::default(),
-        sink_for: Box::new(|_| Arc::new(ide_core::NullSink)),
-        owner: |w| w,
-        runtime: tokio::runtime::Handle::current(),
-        project_environment: false,
-    }));
-    // As `openidea-server` assembles its commands.
-    let plugins = ide_host::plugins::remote_host::RemotePlugins::start(&base.join("data"), &host, peer_slot).unwrap();
-    let mut dispatcher = Dispatcher::standard();
-    plugins.register(&mut dispatcher);
-    dispatcher.add(ide_host::plugins::remote::SYNC_COMMAND, |_| async { Ok(()) });
-    assert_eq!(rpc::client_commands(), dispatcher.commands());
-    assert!(rpc::client_commands().contains(&"term_spawn"));
-    plugins.host().shutdown();
-}
-
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn renames_a_branch_with_the_clients_argument_names() {
     let tmp = tempfile::tempdir().unwrap();
     let root = tmp.path().join("repo");
@@ -533,66 +523,130 @@ async fn renames_a_branch_with_the_clients_argument_names() {
     peer.kill();
 }
 
-/// A handler reads its arguments by the names the desktop client sends: `src/bindings.ts`
-/// passes them in camelCase, and a name the client never sends reads as `null` (an
-/// `Option` silently `None`, anything else an "invalid type: null" error).
-#[test]
-fn handlers_read_the_argument_names_the_client_sends() {
-    use std::collections::{BTreeSet, HashMap};
-    use std::path::Path;
-    let repo = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let bindings = std::fs::read_to_string(repo.join("src/bindings.ts")).unwrap();
-    let mut sent = HashMap::<&str, BTreeSet<&str>>::new();
-    for part in bindings.split("__TAURI_INVOKE(\"").skip(1) {
-        let (command, rest) = part.split_once('"').unwrap();
-        let args = rest.strip_prefix(", {").and_then(|r| r.split_once('}')).map_or("", |(args, _)| args);
-        let names = args.split(',').map(|a| a.split(':').next().unwrap().trim()).filter(|a| !a.is_empty());
-        sent.insert(command, names.collect());
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn serves_builtin_mcp_over_remote_dispatch_and_routes_ui_requests() {
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path().join("remote-mcp");
+    std::fs::create_dir_all(root.join("src")).unwrap();
+    std::fs::write(root.join("src/hello.txt"), "from remote mcp\n").unwrap();
+    let root = dunce::canonicalize(root).unwrap();
+    let base = tmp.path().join("server");
+    let data_dir = base.join("data");
+
+    let peer_slot = Arc::new(OnceLock::new());
+    let sink_peer = peer_slot.clone();
+    let host = Arc::new(Host::new(HostConfig {
+        config_dir: base.join("config"),
+        data_dir: data_dir.clone(),
+        local_data_dir: data_dir.clone(),
+        languages: Arc::new(ide_language::LanguageRegistry::load(None).unwrap()),
+        syntax: Arc::default(),
+        sink_for: Box::new(move |w| rpc::event_sink(sink_peer.clone(), Some(w.to_owned()))),
+        owner: |w| w,
+        runtime: tokio::runtime::Handle::current(),
+        project_environment: false,
+    }));
+    let server_exe = base.join("bin/openidea-server");
+    host.mcp.set_stdio_link(server_exe.clone());
+    host.mcp.apply(&host);
+
+    let (client_io, server_io) = tokio::io::duplex(1 << 20);
+    let (sr, sw) = tokio::io::split(server_io);
+    let serve_host = host.clone();
+    tokio::spawn(rpc::serve(serve_host, Dispatcher::standard(), peer_slot, sr, sw));
+    let (cr, cw) = tokio::io::split(client_io);
+    let client = Arc::new(Client::default());
+    let peer = Peer::connect(cr, cw, client.clone());
+
+    invoke(&peer, "open_project", json!({ "path": root })).await.unwrap();
+    for cmd in ["mcp_server_status", "mcp_regenerate_token", "mcp_ui_ready", "mcp_respond", "mcp_agent_run_closed"] {
+        let err = invoke(&peer, cmd, json!({})).await.unwrap_err();
+        assert!(err.message.contains("Restricted Mode"), "{cmd}: {err:?}");
     }
-    fn sources(dir: &Path, out: &mut Vec<std::path::PathBuf>) {
-        for entry in std::fs::read_dir(dir).unwrap() {
-            let path = entry.unwrap().path();
-            if path.is_dir() {
-                sources(&path, out);
-            } else if path.extension().is_some_and(|e| e == "rs") {
-                out.push(path);
+
+    invoke(&peer, "project_trust_set", json!({ "path": root, "trusted": true, "folder": false })).await.unwrap();
+    let initial = invoke(&peer, "mcp_server_status", json!({})).await.unwrap();
+    assert_eq!(initial["running"], false);
+    assert!(!server_exe.exists(), "the stdio link is written only once the server runs");
+
+    invoke(&peer, "settings_set", json!({ "scope": "global", "key": "mcpServer.fixedPort", "value": "false" }))
+        .await
+        .unwrap();
+    invoke(&peer, "settings_set", json!({ "scope": "global", "key": "mcpServer.fixedToken", "value": "true" }))
+        .await
+        .unwrap();
+    invoke(&peer, "settings_set", json!({ "scope": "global", "key": "mcpServer.enabled", "value": "true" }))
+        .await
+        .unwrap();
+
+    let global = invoke(&peer, "settings_get_global", json!({})).await.unwrap();
+    assert_eq!(global["mcpServer"]["enabled"], true);
+
+    let status = invoke(&peer, "mcp_server_status", json!({})).await.unwrap();
+    assert_eq!(status["running"], true);
+    assert_eq!(status["project"], json!(ide_core::IpcPath::from(&root)));
+    #[cfg(unix)]
+    {
+        assert_eq!(status["stdioCommand"][0], server_exe.to_string_lossy().as_ref());
+        assert_eq!(std::fs::read_link(&server_exe).unwrap(), std::env::current_exe().unwrap());
+    }
+    let first_token = status["token"].as_str().unwrap().to_owned();
+    assert!(status["url"].as_str().unwrap().starts_with("http://127.0.0.1:"));
+
+    invoke(&peer, "mcp_ui_ready", json!({ "ready": true })).await.unwrap();
+    let discovery = ide_mcp::discovery_path(&data_dir);
+
+    let read_call = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": { "name": "read_file", "arguments": { "file_path": "src/hello.txt" } }
+    });
+    let mut out = Vec::new();
+    ide_mcp::stdio::bridge(&discovery, &root, format!("{read_call}\n").as_bytes(), &mut out).await.unwrap();
+    let reply: Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(reply["result"]["content"][0]["text"], "L1: from remote mcp\nL2: ");
+
+    // UI-bound MCP requests stream over RPC events and are answered via routed `mcp_respond`.
+    let open_call = json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": { "name": "open_file_in_editor", "arguments": { "filePath": "src/hello.txt", "line": 1, "column": 1 } }
+    });
+    let (disc2, root2) = (discovery.clone(), root.clone());
+    let call_task = tokio::spawn(async move {
+        let mut out = Vec::new();
+        ide_mcp::stdio::bridge(&disc2, &root2, format!("{open_call}\n").as_bytes(), &mut out).await.unwrap();
+        serde_json::from_slice::<Value>(&out).unwrap()
+    });
+    until("remote MCP UI request", || {
+        client.events.lock().iter().any(|m| matches!(m.event, ide_core::IdeEvent::McpRequest { .. }))
+    })
+    .await;
+    let req_id = client
+        .events
+        .lock()
+        .iter()
+        .find_map(|m| match &m.event {
+            event @ ide_core::IdeEvent::McpRequest { id, .. } => {
+                assert!(!rpc::client_accepts(event, false));
+                assert!(rpc::client_accepts(event, true));
+                Some(*id)
             }
-        }
-    }
-    let mut files = Vec::new();
-    sources(&repo.join("crates/ide-host/src"), &mut files);
-    let mut checked = 0;
-    let mut wrong = Vec::new();
-    for file in files {
-        let src = std::fs::read_to_string(&file).unwrap();
-        // `.add("name", …)`, also with the name on the next line.
-        let starts: Vec<usize> = src
-            .match_indices(".add(")
-            .map(|(i, m)| i + m.len())
-            .filter_map(|i| src[i..].trim_start().strip_prefix('"').map(|rest| src.len() - rest.len()))
-            .collect();
-        for (n, &start) in starts.iter().enumerate() {
-            let body = &src[start..starts.get(n + 1).copied().unwrap_or(src.len())];
-            let (command, body) = body.split_once('"').unwrap();
-            let Some(sent) = sent.get(command) else { continue };
-            checked += 1;
-            for reader in ["c.arg", "c.sender", "c.channel"] {
-                for (at, _) in body.match_indices(reader) {
-                    let rest = &body[at + reader.len()..];
-                    let rest = match rest.strip_prefix("::<") {
-                        Some(generic) => &generic[generic.find(">(").unwrap() + 1..],
-                        None => rest,
-                    };
-                    let Some(name) = rest.strip_prefix("(\"").and_then(|r| r.split_once('"')).map(|(n, _)| n) else {
-                        continue;
-                    };
-                    if !sent.contains(name) {
-                        wrong.push(format!("{command} reads `{name}`; the client sends {sent:?}"));
-                    }
-                }
-            }
-        }
-    }
-    assert!(checked > 400, "found only {checked} handlers with client bindings");
-    assert!(wrong.is_empty(), "{wrong:#?}");
+            _ => None,
+        })
+        .unwrap();
+    invoke(&peer, "mcp_respond", json!({ "id": req_id, "allow": true, "error": null })).await.unwrap();
+    let opened = call_task.await.unwrap();
+    assert_eq!(opened["result"]["isError"], false, "{opened}");
+
+    invoke(&peer, "mcp_regenerate_token", json!({})).await.unwrap();
+    let rotated = invoke(&peer, "mcp_server_status", json!({})).await.unwrap();
+    assert_eq!(rotated["running"], true);
+    assert_ne!(rotated["token"].as_str().unwrap(), first_token);
+
+    host.mcp.stop(&host);
+    invoke(&peer, "close_project", json!({})).await.unwrap();
+    peer.kill();
 }

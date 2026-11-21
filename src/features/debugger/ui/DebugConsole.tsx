@@ -18,6 +18,8 @@ import { useWorkflowSettings } from "@/platform/workflowSettings";
 import { useConsoleFont } from "@/platform/consoleFont";
 import { spanStyle } from "@/ui/ansi";
 import { logLineColor } from "@/ui/logColors";
+import { compileConsoleRules, matchConsoleRules, styleSpans, type ConsoleRuleMatch } from "@/ui/consoleRules";
+import { useConsoleRules } from "@/workbench/contributions";
 import { ConsoleFindBar } from "@/ui/ConsoleFindBar";
 import { DEFAULT_FIND_OPTIONS, findInLines, type FindOptions, type FindResult } from "@/ui/consoleFind";
 import {
@@ -34,7 +36,7 @@ import {
 import { pushHistory, readHistory, setConsoleHistoryBrowser } from "./expressionHistory";
 import { useExpressionCompletion } from "./ExpressionCompletion";
 import { findOutputLinks, type OutputLink } from "@/features/run/links";
-import { openTarget, openUrl, runDirectory } from "@/features/run/navigate";
+import { debugConsoleUrl, openTarget, openUrl, runDirectory } from "@/features/run/navigate";
 import { segmentLine, type SegmentMark } from "@/features/run/segments";
 import styles from "./DebugToolWindow.module.css";
 import { WidestColumns } from "@/platform/consoleColumns";
@@ -48,19 +50,22 @@ const DebugLine = memo(
   function DebugLine({
     line,
     marks,
+    rules,
     cwd,
   }: {
     line: ConsoleLine;
     marks?: readonly SegmentMark[];
+    rules?: ConsoleRuleMatch;
     length: number;
     cwd: string;
   }) {
-    const segments = segmentLine(line.spans, line.category === "system" ? [] : findOutputLinks(line.text), marks);
+    const spans = rules ? styleSpans(line.spans, rules) : line.spans;
+    const segments = segmentLine(spans, line.category === "system" ? [] : findOutputLinks(line.text), marks);
     const activate = (e: MouseEvent, link: OutputLink) => {
       e.preventDefault();
       if (window.getSelection()?.toString()) return;
-      if (link.kind === "url") void openUrl(link.url);
-      else void openTarget(link.target, cwd);
+      if (link.kind !== "url") void openTarget(link.target, cwd);
+      else if (!debugConsoleUrl(e, link.url)) void openUrl(link.url);
     };
     if (segments.length === 0) return <>{"\u200B"}</>;
     return (
@@ -100,7 +105,7 @@ const DebugLine = memo(
       </>
     );
   },
-  (a, b) => a.line === b.line && a.length === b.length && a.cwd === b.cwd && a.marks === b.marks,
+  (a, b) => a.line === b.line && a.length === b.length && a.cwd === b.cwd && a.marks === b.marks && a.rules === b.rules,
 );
 
 export function DebugServiceConsole({ sessionId }: { sessionId: number }) {
@@ -123,10 +128,16 @@ export function DebugConsole({ session, interactive = true }: { session: DebugSe
   // The debug console uses the same font as the Run console.
   const consoleFont = useConsoleFont();
   const { rowHeight } = consoleFont;
-  const fontStyle = { fontFamily: consoleFont.family, fontSize: `${consoleFont.size}px` };
+  const fontStyle = {
+    fontFamily: consoleFont.family,
+    fontSize: `${consoleFont.size}px`,
+    fontWeight: consoleFont.weight,
+    ["--fw-code-bold" as string]: String(consoleFont.boldWeight),
+  };
   // Settings › Console › Use soft wraps is the default; the toggle overrides it for this console.
   const defaultWrap = useWorkflowSettings((s) => s.console.softWrap);
   const logColors = useWorkflowSettings((s) => s.console.logColors);
+  const consoleRules = compileConsoleRules(useConsoleRules((s) => s.providers));
   const [wrapOverride, setWrapOverride] = useState<boolean | null>(null);
   const softWrap = wrapOverride ?? defaultWrap;
   const [widest] = useState(() => new WidestColumns());
@@ -463,17 +474,24 @@ export function DebugConsole({ session, interactive = true }: { session: DebugSe
             {virtualizer.getVirtualItems().map((item) => {
               const l = lines?.[item.index];
               if (!l) return null;
-              // The level colour is the inherited fallback; spans with their own ANSI colour win.
-              const color = logLineColor(l.text, l.category, logColors);
+              // As in the Run console: a whole-line rule replaces the level colour.
+              const ruled = matchConsoleRules(l.text, l.category, consoleRules);
+              const color = ruled?.line ? ruled.line.fg : logLineColor(l.text, l.category, logColors);
               return (
                 <span
                   key={item.key}
                   data-index={item.index}
                   ref={virtualizer.measureElement}
                   className={clsx(styles.out, styles[`cat-${l.category}`])}
-                  style={{ transform: `translateY(${item.start}px)`, color }}
+                  style={{ transform: `translateY(${item.start}px)`, color, background: ruled?.line?.bg }}
                 >
-                  <DebugLine line={l} marks={marksByLine.get(item.index)} length={l.text.length} cwd={cwd} />
+                  <DebugLine
+                    line={l}
+                    marks={marksByLine.get(item.index)}
+                    rules={ruled}
+                    length={l.text.length}
+                    cwd={cwd}
+                  />
                 </span>
               );
             })}

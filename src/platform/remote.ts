@@ -15,6 +15,7 @@ import {
   isTauri,
   type ChannelFrame,
   type RemoteProgress,
+  type RemoteProject,
   type RemoteSession,
   type RemoteTarget,
 } from "./ipc";
@@ -25,9 +26,13 @@ import { useProject } from "./project";
 
 interface RemoteState {
   session: RemoteSession | null;
+  /** The host the connection was lost to (the window's project is unreachable), else null. */
+  lost: string | null;
+  /** A reconnection to the lost host is in progress. */
+  reconnecting: boolean;
 }
 
-export const useRemote = create<RemoteState>(() => ({ session: null }));
+export const useRemote = create<RemoteState>(() => ({ session: null, lost: null, reconnecting: false }));
 
 let routed = new Set<string>();
 let nextChannel = 1;
@@ -67,19 +72,31 @@ async function remoteInvoke(cmd: string, args?: InvokeArgs, options?: InvokeOpti
   return value;
 }
 
+function isRemoteHostOnlySetting(key: string): boolean {
+  return key === "mcpServer" || key.startsWith("mcpServer.");
+}
+
 /**
  * Where a command of a remote window runs. Local always: opening a project (a
  * local folder; leaving the remote one) and closing it (that drops the
  * connection, which ends the server's session). Client UI settings stay local.
- * Both: a global tooling setting, which
- * the server's language servers and the local windows read.
+ * Host-specific service settings (`mcpServer.*`) apply to the remote host only;
+ * other global tooling settings apply on both sides.
  */
 export function remoteRouting(cmd: string, args: InvokeArgs | undefined, served: ReadonlySet<string>) {
-  if (cmd === "system_font_families" || cmd === "settings_get_global") return "local";
+  if (cmd === "system_font_families") return "local";
   if (cmd === "settings_set" && isClientSetting((args as { key?: string } | undefined)?.key ?? "")) return "local";
   if (!served.has(cmd) || cmd === "open_project" || cmd === "close_project") return "local";
+  if (cmd === "settings_set" && isRemoteHostOnlySetting((args as { key?: string } | undefined)?.key ?? "")) {
+    return served.has("mcp_server_status") ? "remote" : "local";
+  }
   if (cmd === "settings_set" && (args as { scope?: string } | undefined)?.scope === "global") return "both";
   return "remote";
+}
+
+/** This machine's own global settings (for desktop SSH configurations even in a remote window). */
+export function localGlobalSettings(): Promise<Settings> {
+  return isTauri() ? invokeLocal<Settings>("settings_get_global") : commands.settingsGetGlobal();
 }
 
 /** All effective settings responses use the same client overlay, including writes and project snapshots. */
@@ -109,7 +126,7 @@ const route: InvokeRoute = (cmd, args, options) => {
   }
   if (destination === "local") return null;
   return remoteInvoke(cmd, args, options).then(async (result) => {
-    if (cmd === "settings_get") return clientSettings(result as Settings);
+    if (cmd === "settings_get" || cmd === "settings_get_global") return clientSettings(result as Settings);
     if (cmd === "project_current" && result) {
       const project = result as { settings: Settings };
       return { ...project, settings: await clientSettings(project.settings) };
@@ -124,14 +141,14 @@ const route: InvokeRoute = (cmd, args, options) => {
  */
 export function enableRemote(session: RemoteSession) {
   routed = new Set(session.commands);
-  useRemote.setState({ session });
+  useRemote.setState({ session, lost: null, reconnecting: false });
   setInvokeRoute(route);
 }
 
 export function disableRemote() {
   routed = new Set();
   setInvokeRoute(null);
-  useRemote.setState({ session: null });
+  useRemote.setState({ session: null, lost: null, reconnecting: false });
 }
 
 export function isRemoteWindow(): boolean {
@@ -162,6 +179,34 @@ export const useRemoteProgress = create<{ progress: RemoteProgress | null; locat
   location: null,
 }));
 
+/** Routes this window to the server `remoteConnect` answered with and shows its project. */
+async function attachRemote(r: RemoteProject, path: string): Promise<void> {
+  enableRemote({ target: r.target, root: r.root, host: r.host, os: r.os, commands: r.commands });
+  if (takeLegacyRemoteTrust(r.target, path, r.host)) {
+    const status = await call(commands.projectTrustStatus(r.root));
+    if (!status.decided) await call(commands.projectTrustSet(r.root, true, false));
+    if (!(await call(commands.remoteTrustStatus())).decided) await call(commands.remoteTrustSet(true));
+  }
+  try {
+    await confirmProjectTrust(r.root);
+  } catch (error) {
+    await commands.closeProject();
+    disableRemote();
+    throw error;
+  }
+  const current = await commands.projectCurrent();
+  if (current) r.project = current;
+  r.project.settings = await clientSettings(r.project.settings);
+  useProject.setState({ project: r.project, settings: r.project.settings });
+  rememberRemote({
+    target: r.target,
+    path: r.root,
+    name: r.project.displayName || r.project.name,
+    host: r.host,
+    openedAtMs: Date.now(),
+  });
+}
+
 /**
  * Opens `path` of `target` (an SSH host or a WSL distribution) in this window. A dev container's
  * project folder is the one in the container: `path` is then only a label.
@@ -185,36 +230,31 @@ export async function connectRemote(target: RemoteTarget, path: string) {
       await commands.remoteDisconnect().catch(() => {});
       throw new IpcError({ kind: "cancelled", message: "Remote connection cancelled" });
     }
-    enableRemote({ target: r.target, root: r.root, host: r.host, os: r.os, commands: r.commands });
-    if (takeLegacyRemoteTrust(r.target, path, r.host)) {
-      const status = await call(commands.projectTrustStatus(r.root));
-      if (!status.decided) await call(commands.projectTrustSet(r.root, true, false));
-      if (!(await call(commands.remoteTrustStatus())).decided) await call(commands.remoteTrustSet(true));
-    }
-    try {
-      await confirmProjectTrust(r.root);
-    } catch (error) {
-      await commands.closeProject();
-      disableRemote();
-      throw error;
-    }
-    const current = await commands.projectCurrent();
-    if (current) r.project = current;
-    r.project.settings = await clientSettings(r.project.settings);
-    useProject.setState({ project: r.project, settings: r.project.settings });
-    rememberRemote({
-      target: r.target,
-      path: r.root,
-      name: r.project.displayName || r.project.name,
-      host: r.host,
-      openedAtMs: Date.now(),
-    });
+    await attachRemote(r, path);
     return r;
   } finally {
     if (useRemoteProgress.getState().location === location) {
       useProject.setState({ opening: false });
       useRemoteProgress.setState({ progress: null, location: null });
     }
+  }
+}
+
+/**
+ * Connects this window to its remote project again after the connection was lost. The new server
+ * has none of the old one's documents, terminals or sessions, so the window opens its project
+ * again (editors come back from their saved tabs), as reopening the remote project would.
+ */
+export async function reconnectRemote(): Promise<void> {
+  const session = useRemote.getState().session;
+  if (!session) return;
+  useRemote.setState({ reconnecting: true });
+  try {
+    const r = await call(commands.remoteConnect(session.target, session.root, new Channel<RemoteProgress>()));
+    useProject.setState({ project: null });
+    await attachRemote(r, session.root);
+  } finally {
+    useRemote.setState({ reconnecting: false });
   }
 }
 

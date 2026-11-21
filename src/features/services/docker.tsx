@@ -19,6 +19,8 @@ import type {
 } from "@/platform/ipc";
 import { tx, useTx, useTxTemplate } from "@/platform/i18n";
 import { call, commands, isCancelled, nextRequestId } from "@/platform/ipc";
+import { sshLabel } from "@/platform/remoteSettings";
+import { workflowSettings } from "@/platform/workflowSettings";
 import { Button, EmptyState, IconButton, LogPane, Spinner, Tabs, T } from "@/ui";
 import type { MenuItem } from "@/ui";
 import {
@@ -72,7 +74,9 @@ import {
 } from "./ops";
 import {
   cancelTask,
+  connectConnection,
   connectionState,
+  disconnectConnection,
   endpointOf,
   errorMessage,
   refresh,
@@ -100,10 +104,15 @@ function endpointText(ep: DockerEndpoint): string {
       return ep.tlsCertDir ? `${ep.host} (TLS)` : ep.host;
     case "context":
       return `context ${ep.name}`;
+    case "ssh": {
+      const config = workflowSettings().ssh.configs.find((c) => c.id === ep.config);
+      return `SSH ${config ? sshLabel(config) : ep.config}`;
+    }
   }
 }
 
 function connectionDetail(state: ConnectionState): string | undefined {
+  if (state.disconnected) return "disconnected";
   const a = state.snapshot?.availability;
   if (!a) return state.error ?? (state.loading ? "connecting…" : undefined);
   if (a.kind === "notInstalled") return "docker not installed";
@@ -244,6 +253,9 @@ function menu(item: ServiceTreeItem): MenuItem[] {
   if (c)
     items.push(
       { kind: "separator" },
+      connectionState(c.id).disconnected
+        ? { label: "Connect", run: () => void connectConnection(c.id) }
+        : { label: "Disconnect", run: () => disconnectConnection(c.id) },
       { label: "Edit Connection…", icon: "edit", run: () => openConnectionDialog(c) },
       { label: "Remove Connection", icon: "trash", danger: true, run: () => void removeConnectionPrompt(c) },
     );
@@ -433,6 +445,13 @@ function DockerDetail({ item }: { item: ServiceTreeItem }) {
   if (!target || !parsed || !state || !node) return <EmptyState title="Select service to view details" />;
   const conn = connectionOf(parsed.conn);
   const snapshot = state.snapshot;
+  if (state.disconnected)
+    return (
+      <EmptyState
+        title="Disconnected"
+        actions={<Button onClick={() => void connectConnection(parsed.conn)}>Connect</Button>}
+      />
+    );
   if (!snapshot)
     return (
       <div className={styles.loading}>
@@ -463,7 +482,9 @@ function DockerDetail({ item }: { item: ServiceTreeItem }) {
         )}
         <EmptyState title={conn?.name ?? "Docker"}>
           <div>
-            {txTemplate(`Engine ${a.serverVersion} · CLI ${a.clientVersion}`)}
+            {a.clientVersion
+              ? txTemplate(`Engine ${a.serverVersion} · CLI ${a.clientVersion}`)
+              : txTemplate(`Engine ${a.serverVersion}`)}
             {a.context ? txTemplate(` · context ${a.context}`) : ""}
           </div>
           {conn && <div className={styles.hint}>{endpointText(conn.endpoint)}</div>}

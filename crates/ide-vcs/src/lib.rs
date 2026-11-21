@@ -307,6 +307,20 @@ pub struct ChangedFile {
     pub path: String,
     pub kind: ChangeKind,
     pub old_path: Option<String>,
+    /// Set when the entry is a symbolic link (git mode `120000`); only revision diffs fill it.
+    #[serde(default)]
+    #[specta(optional)]
+    pub link: Option<LinkTarget>,
+}
+
+/// What a symbolic link in a revision points to, resolved inside that revision's tree.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum LinkTarget {
+    Dir,
+    File,
+    /// Dangling, outside the repository (absolute or above its root), or a link loop.
+    Unresolved,
 }
 
 /// Added and deleted lines of one file between two revisions (`git diff --numstat`).
@@ -334,6 +348,10 @@ pub struct RevisionChange {
     pub before: Option<String>,
     /// Commit holding the new content; `None` when the file was deleted.
     pub after: Option<String>,
+    /// Set when the entry is a symbolic link, resolved at `after` (`before`, for a deletion).
+    #[serde(default)]
+    #[specta(optional)]
+    pub link: Option<LinkTarget>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Type)]
@@ -342,6 +360,10 @@ pub struct Stash {
     pub index: u32,
     pub message: String,
     pub time_ms: f64,
+    /// The stash commit; its changes are those against `base`.
+    pub id: String,
+    /// The commit the stash was made on (the stash commit's first parent).
+    pub base: Option<String>,
 }
 
 /// Push dialog › Push tags: every tag, or only annotated tags on the pushed commits.
@@ -496,6 +518,9 @@ pub struct CheckoutOptions {
     /// Required when checking out a remote branch whose local namesake is ahead of it.
     #[serde(default)]
     pub diverged: Option<DivergedLocal>,
+    /// Check the branch out even though another worktree has it checked out.
+    #[serde(default)]
+    pub ignore_other_worktrees: bool,
 }
 
 /// Result of [`Repo::checkout_with`]; the non-`Done` variants other than `Conflicts`
@@ -508,9 +533,12 @@ pub enum CheckoutOutcome {
     LocalChanges {
         files: Vec<String>,
     },
-    /// These untracked files (repository-relative paths) would be overwritten.
+    /// These untracked files (repository-relative paths) would be overwritten by the
+    /// checkout; with `removed`, they would be removed by it (tracked here, absent
+    /// from the target).
     UntrackedFiles {
         files: Vec<String>,
+        removed: bool,
     },
     /// Local branch `local` has commits that remote branch `remote` does not.
     LocalBranchAhead {
@@ -521,6 +549,12 @@ pub enum CheckoutOutcome {
     /// on conflicts in these files.
     Conflicts {
         files: Vec<String>,
+    },
+    /// Git refused: `branch` is checked out in the linked worktree at `path`. Nothing
+    /// changed; the branch can be worked on there.
+    CheckedOutInWorktree {
+        branch: String,
+        path: PathBuf,
     },
 }
 
@@ -618,6 +652,7 @@ pub mod changelists;
 mod cli;
 mod compare;
 mod diff;
+mod external_diff;
 mod history;
 mod ignore;
 mod index_writes;
@@ -644,6 +679,7 @@ pub use cli::{
     set_git_command_observer, set_git_executable,
 };
 pub use diff::build_partial_patch;
+pub use external_diff::{ExternalDiffSide, launch_external_diff};
 pub use ignore::{IgnoreDestination, add_to_ignore};
 pub use manage::{MergeOptions, RebaseOptions, RemoteEdit, Worktree};
 pub use remotes::Remote;
@@ -732,6 +768,8 @@ pub struct Repo {
     git_dir: PathBuf,
     inner: std::sync::Mutex<repo::Cache>,
     ignored: std::sync::RwLock<IgnoredNames>,
+    /// Working-tree status from `git status` instead of gitoxide.
+    cli_status: std::sync::atomic::AtomicBool,
     log_index: std::sync::Mutex<log_index::LogIndex>,
     log_signatures: std::sync::Mutex<std::collections::HashMap<String, LogDetails>>,
 }
@@ -757,6 +795,11 @@ impl Repo {
     pub fn set_ignored_names(&self, names: IgnoredNames) {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         *self.ignored.write().unwrap_or_else(|p| p.into_inner()) = names;
+    }
+    /// Read the working-tree status with `git status` rather than in process: for file systems
+    /// (encryption or protection layers) whose metadata only the system git reads correctly.
+    pub fn set_cli_status(&self, on: bool) {
+        self.cli_status.store(on, std::sync::atomic::Ordering::Release);
     }
     /// Staged (HEAD↔index) and unstaged (index↔worktree, incl. untracked) changes,
     /// sorted by path. Conflicted files report `unstaged: Conflicted` and no staged kind.
@@ -883,6 +926,12 @@ impl Repo {
         let encoding = encoding.into();
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         write::blame(self, path, current_text, revision, encoding)
+    }
+    /// Adds `commit` to the list `blame.ignoreRevsFile` names, so annotate skips it; with none
+    /// configured, to `.git-blame-ignore-revs` at the worktree root, which the local config then names.
+    pub fn ignore_blame_revision(&self, commit: &str) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        write::ignore_blame_revision(self, commit)
     }
     /// History for Selection: commits that changed `lines` (0-based, inclusive, of the
     /// current text: `current_text`, or the file on disk), mapped to HEAD's lines first.
@@ -1122,6 +1171,20 @@ impl Repo {
         Ok((out.code == Some(0)).then(|| out.stdout_str().trim().to_string()))
     }
 
+    /// Sets `user.name` and `user.email` for commits: in this repository's config, or in the
+    /// user's global one (`global`).
+    pub fn set_user_identity(&self, name: &str, email: &str, global: bool) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        let scope = if global { "--global" } else { "--local" };
+        for (key, value) in [("user.name", name.trim()), ("user.email", email.trim())] {
+            if value.is_empty() {
+                return Err(IdeError::invalid(format!("{key} must not be empty")));
+            }
+            cli::run(&self.root, &["config", scope, key, value], None)?;
+        }
+        Ok(())
+    }
+
     // ---- writes (git CLI) ----
     pub fn stage(&self, paths: &[PathBuf]) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
@@ -1142,7 +1205,8 @@ impl Repo {
         write::stage_patch(self, patch, &|path| encoding(path).map(Into::into))
     }
     /// Discards unstaged changes: tracked paths are restored from the index (staged
-    /// changes are kept), untracked files and directories are deleted.
+    /// changes are kept), untracked files and directories are deleted. A submodule goes back
+    /// to the commit the index records, with its tracked files restored.
     pub fn discard(&self, paths: &[PathBuf]) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         write::discard(self, paths)
@@ -1262,10 +1326,17 @@ impl Repo {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         write::rebase(self, onto)
     }
+    /// `paths` (absolute) stashes only those files; empty stashes the whole working tree.
     /// `keep_index`: changes already staged stay in the index (and the working tree).
-    pub fn stash_push(&self, message: Option<&str>, include_untracked: bool, keep_index: bool) -> IdeResult<()> {
+    pub fn stash_push(
+        &self,
+        message: Option<&str>,
+        include_untracked: bool,
+        keep_index: bool,
+        paths: &[PathBuf],
+    ) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
-        write::stash_push(self, message, include_untracked, keep_index)
+        write::stash_push(self, message, include_untracked, keep_index, paths)
     }
     /// `reinstate_index`: also restore what was staged when the stash was made.
     pub fn stash_apply(&self, index: u32, pop: bool, reinstate_index: bool) -> IdeResult<()> {

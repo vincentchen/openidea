@@ -331,7 +331,7 @@ targetIndex, or narrow the call with a contextSnippet that shows the one you mea
             FileEdit::Rename { from, to } => vec![from, to],
         };
         for p in paths {
-            if let Err(e) = super::super::tool::ensure_inside(call.root(), p) {
+            if let Err(e) = call.ensure_writable_place(p) {
                 let hint = format!(
                     "{}. Nothing was renamed. A rename that must change a file outside the project cannot run here.",
                     e.message
@@ -869,19 +869,20 @@ async fn occurrences(
         scope,
         max_matches: 0,
         context,
+        include_excluded: false,
     };
     let host = call.host();
     let request = crate::mcp::tool::request_id();
     let files = Arc::new(Mutex::new(Vec::new()));
-    let emit: crate::ops::Emit<SearchEvent> = {
+    let emit = {
         let files = files.clone();
-        Arc::new(move |event| {
+        crate::ops::Channel::new(move |event: SearchEvent| {
             if let SearchEvent::File { file } = event {
                 files.lock().push(file);
             }
         })
     };
-    let search = crate::ops::search::start(&host, call.window(), request, query, emit);
+    let search = crate::ops::search::search_start(&host, call.window(), request, query, emit);
     tokio::pin!(search);
     tokio::select! {
         r = &mut search => r?,

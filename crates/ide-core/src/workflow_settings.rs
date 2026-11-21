@@ -20,6 +20,34 @@ pub struct VcsSettings {
     pub shelf: ShelfSettings,
     /// Issue Navigation: commit-message patterns turned into links.
     pub issue_navigation: Vec<IssueLink>,
+    /// Directory Mappings: repository roots added to or excluded from the detected ones.
+    pub mappings: VcsMappings,
+}
+
+/// Directory Mappings on top of repository detection. Paths are relative to the project
+/// root (`.` for the root itself) or absolute outside it.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct VcsMappings {
+    /// Detected repositories the IDE leaves alone: no Git or Commit integration, files stay.
+    pub excluded: Vec<String>,
+    /// Repository roots detection does not reach (outside the project, or deeper).
+    pub added: Vec<String>,
+}
+
+impl VcsMappings {
+    pub fn is_empty(&self) -> bool {
+        self.excluded.is_empty() && self.added.is_empty()
+    }
+
+    /// `path` resolved against `project_root`.
+    pub fn resolve(project_root: &std::path::Path, path: &str) -> std::path::PathBuf {
+        match path {
+            "" | "." => project_root.to_path_buf(),
+            p if std::path::Path::new(p).is_absolute() => p.into(),
+            p => project_root.join(p),
+        }
+    }
 }
 
 impl Default for VcsSettings {
@@ -34,6 +62,7 @@ impl Default for VcsSettings {
             confirmation: VcsConfirmationSettings::default(),
             shelf: ShelfSettings::default(),
             issue_navigation: Vec::new(),
+            mappings: VcsMappings::default(),
         }
     }
 }
@@ -43,6 +72,9 @@ impl Default for VcsSettings {
 pub struct GitSettings {
     /// Show blame after the current editor line.
     pub inline_blame: bool,
+    /// A click (or Enter / Space) on the inline blame label opens its commit; off, the
+    /// label is plain text and a click on it places the caret as past the line end.
+    pub inline_blame_clickable: bool,
     pub show_branch_in_project_view: bool,
     /// Path to the git executable; empty = auto-detect.
     pub executable: String,
@@ -54,6 +86,8 @@ pub struct GitSettings {
     pub warn_detached_head: bool,
     /// Background check for incoming commits: `auto` | `always` | `never`.
     pub incoming_check: String,
+    /// Minutes between background checks for incoming commits.
+    pub incoming_check_interval: u32,
     /// Branch name globs, `;`/`,`-separated; force push to them is prohibited.
     pub protected_branches: String,
     /// Initial state of Commit Options › Sign-off Commit.
@@ -69,12 +103,19 @@ pub struct GitSettings {
     pub push_dialog_only_protected: bool,
     /// Stashes and shelves share one tab.
     pub combine_stash_and_shelf: bool,
+    /// The non-modal Commit tool window works on the index: Staged / Unstaged groups,
+    /// stage and unstage instead of inclusion checkboxes, and no change lists.
+    pub staging_area: bool,
+    /// Scan the working tree with `git status` (for file systems whose metadata only
+    /// the system git reads correctly) instead of in process.
+    pub cli_status: bool,
 }
 
 impl Default for GitSettings {
     fn default() -> Self {
         Self {
             inline_blame: false,
+            inline_blame_clickable: true,
             show_branch_in_project_view: false,
             executable: String::new(),
             update_method: "merge".into(),
@@ -82,6 +123,7 @@ impl Default for GitSettings {
             warn_crlf: true,
             warn_detached_head: true,
             incoming_check: "auto".into(),
+            incoming_check_interval: 15,
             protected_branches: "master; main".into(),
             sign_off: false,
             warn_large_files: true,
@@ -90,6 +132,8 @@ impl Default for GitSettings {
             show_push_dialog: true,
             push_dialog_only_protected: false,
             combine_stash_and_shelf: false,
+            staging_area: false,
+            cli_status: false,
         }
     }
 }
@@ -124,6 +168,8 @@ pub struct CommitSettings {
     /// `Settings::default()`, or `SettingsStore::set` rejects the key as unknown.
     #[specta(optional)]
     pub double_click_opens_diff: Option<bool>,
+    /// Team conventions for Generate Commit Message with Agent, added to its prompt.
+    pub agent_instructions: String,
 }
 
 impl Default for CommitSettings {
@@ -145,6 +191,7 @@ impl Default for CommitSettings {
             wrap_at_margin: false,
             disabled_plugin_checks: Vec::new(),
             double_click_opens_diff: None,
+            agent_instructions: String::new(),
         }
     }
 }
@@ -172,6 +219,24 @@ impl Default for VcsConfirmationSettings {
             confirm_drop_commits: true,
             on_patch_created: "ask".into(),
         }
+    }
+}
+
+/// Tools › Diff & Merge › External Diff Tools: a program that shows two files' differences.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ExternalDiffSettings {
+    /// Offer Show Diff in External Tool in diff viewers.
+    pub enabled: bool,
+    /// The program to start.
+    pub path: String,
+    /// Its arguments: `%1` the left file, `%2` the right file, `%3` the diff's title.
+    pub parameters: String,
+}
+
+impl Default for ExternalDiffSettings {
+    fn default() -> Self {
+        Self { enabled: false, path: String::new(), parameters: "%1 %2 %3".into() }
     }
 }
 
@@ -219,6 +284,30 @@ impl Default for LogLevelColors {
     }
 }
 
+/// Database settings: Query Execution and SQL Resolution Scopes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct DatabaseSettings {
+    /// A console's result sets show under the statements that produced them, in the editor,
+    /// instead of in the Services view's result tabs.
+    pub in_editor_results: bool,
+    /// Languages & Frameworks › SQL Resolution Scopes: the data source SQL in a file or folder
+    /// resolves against (completion, inspections, navigation), most specific path first.
+    pub resolution_scopes: Vec<SqlResolutionScope>,
+}
+
+/// One row of SQL Resolution Scopes.
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct SqlResolutionScope {
+    /// Project-relative file or folder, `/`-separated; empty for the whole project.
+    pub path: String,
+    /// Data source id.
+    pub data_source: String,
+    /// Schema unqualified names resolve in; empty for the data source's default.
+    pub schema: String,
+}
+
 /// Build, Execution, Deployment › Console.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
@@ -260,18 +349,26 @@ pub struct DebuggerSettings {
     pub show_on_breakpoint: bool,
     pub focus_app_on_breakpoint: bool,
     pub hide_on_termination: bool,
+    /// A breakpoint or exception hit brings the Debug tool window's Threads & Variables tab to the front.
+    pub variables_on_breakpoint: bool,
     pub breakpoints_any_file: bool,
     /// While suspended, hovering the start of a line shows a Run to Cursor button.
     pub run_to_cursor_inlay: bool,
     pub inline_values: bool,
     /// Data Views: list variables by name instead of the adapter's order.
     pub sort_values: bool,
+    /// Data Views: evaluate watches while the program runs, where the debugger can (JavaScript).
+    pub live_watches: bool,
     pub value_tooltip: bool,
     /// While suspended, selecting an expression shows its value.
     pub value_tooltip_on_selection: bool,
     pub value_tooltip_delay: u32,
     /// Stepping: do not step into library code (debugpy `justMyCode`, js-debug `skipFiles`).
     pub skip_library_code: bool,
+    /// JavaScript: debugging a dev server (`vite`, `next dev`) also opens its page in a browser session.
+    pub debug_server_page: bool,
+    /// Flutter: saving a Dart file of a running debug session hot reloads the app.
+    pub flutter_hot_reload_on_save: bool,
     pub python: PythonDebuggerSettings,
 }
 
@@ -281,14 +378,18 @@ impl Default for DebuggerSettings {
             show_on_breakpoint: true,
             focus_app_on_breakpoint: false,
             hide_on_termination: false,
+            variables_on_breakpoint: true,
             breakpoints_any_file: false,
             run_to_cursor_inlay: true,
             inline_values: true,
             sort_values: false,
+            live_watches: false,
             value_tooltip: true,
             value_tooltip_on_selection: true,
             value_tooltip_delay: 700,
             skip_library_code: true,
+            debug_server_page: false,
+            flutter_hot_reload_on_save: true,
             python: PythonDebuggerSettings::default(),
         }
     }
@@ -318,6 +419,8 @@ pub struct RunSettings {
     /// Ask before closing a Run tab whose process is still running.
     pub confirm_terminate: bool,
     pub show_on_start: bool,
+    /// New Run/Debug tabs start pinned: a later run doesn't take their place once finished.
+    pub pin_tabs: bool,
     /// Grace period between interrupt and kill when stopping a process.
     pub termination_timeout_ms: u32,
 }
@@ -329,6 +432,7 @@ impl Default for RunSettings {
             confirm_rerun: true,
             confirm_terminate: true,
             show_on_start: true,
+            pin_tabs: false,
             termination_timeout_ms: 3000,
         }
     }
@@ -359,6 +463,8 @@ pub struct TerminalSettings {
     /// `block` | `underline` | `bar`.
     pub cursor_shape: String,
     pub cursor_blink: bool,
+    /// Cap PTY→xterm paint rate: `unlimited` | `60` | `30` | `15` | `10`.
+    pub max_fps: String,
     pub use_editor_font: bool,
     pub font_family: String,
     pub font_size: f32,
@@ -390,6 +496,7 @@ impl Default for TerminalSettings {
             escape_to_editor: false,
             cursor_shape: "block".into(),
             cursor_blink: true,
+            max_fps: "unlimited".into(),
             use_editor_font: true,
             font_family: "JetBrains Mono".into(),
             font_size: 13.0,

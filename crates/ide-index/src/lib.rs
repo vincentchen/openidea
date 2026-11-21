@@ -21,6 +21,7 @@ mod matching;
 mod store;
 mod worker;
 
+pub use filter::walk_skips;
 pub use worker::MAX_SYMBOL_FILE;
 use worker::{Job, MAX_RECENT, Shared};
 
@@ -47,6 +48,17 @@ pub struct SymbolMatch {
     pub score: u32,
     /// Matched char indices within `name`.
     pub indices: MatchIndices,
+}
+
+/// A class declaration of the index and the base names written in its source.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClassDecl {
+    pub path: PathBuf,
+    pub name: String,
+    /// Selection range: the class name's identifier.
+    pub range: Range,
+    /// Bare base names, as written (`class X(pkg.mod.Base)` keeps `Base`).
+    pub bases: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -205,9 +217,32 @@ impl ProjectIndex {
                     kind: s.kind,
                     container: s.container.map(ToString::to_string),
                     range: s.range,
+                    bases: s.bases.split('\0').filter(|b| !b.is_empty()).map(str::to_owned).collect(),
                 })
                 .collect(),
         )
+    }
+
+    /// Every class declaration of the indexed project (content roots included) with the
+    /// base names written in its source, in path order. The UI builds an inheritance
+    /// graph from it, so it needs no language server's type hierarchy.
+    pub fn inheritance(&self) -> Vec<ClassDecl> {
+        let data = self.shared.data.read();
+        let mut out = Vec::new();
+        for entry in data.files.iter().flatten() {
+            for s in data.symbols_of(entry) {
+                if s.kind != SymbolKind::Class {
+                    continue;
+                }
+                out.push(ClassDecl {
+                    path: entry.path.clone(),
+                    name: s.name.to_owned(),
+                    range: s.range,
+                    bases: s.bases.split('\0').filter(|b| !b.is_empty()).map(str::to_owned).collect(),
+                });
+            }
+        }
+        out
     }
 
     /// Bounded file inventory for background plugin indexers; honors the same
@@ -323,6 +358,11 @@ impl ProjectIndex {
         matching::symbols_named_within(&self.shared.data.read(), name, kind, roots, limit)
     }
 
+    /// Symbols named exactly one of `names` whose file is inside `root`, at most `limit` per name.
+    pub fn symbols_named_any(&self, names: &[String], root: &Path, limit: usize) -> Vec<SymbolMatch> {
+        matching::symbols_named_any(&self.shared.data.read(), names, root, limit)
+    }
+
     /// Incrementally re-indexes changed paths (called from the vfs watcher).
     /// Cheap: the work is queued for the indexing thread.
     pub fn update(&self, changed: &[PathBuf], removed: &[PathBuf]) {
@@ -360,15 +400,10 @@ impl ProjectIndex {
 
     /// Boost for "recent files" ranking.
     /// Records a recently opened file; a virtual document's URI (library
-    /// class) is kept verbatim, like IDEA lists library classes in Recent Files.
+    /// class) is kept verbatim, and a file outside the project (a scratch file)
+    /// by its absolute path.
     pub fn mark_recent(&self, path: &Path) {
-        let path = match path.to_str() {
-            Some(s) if ide_core::text::is_virtual_uri(s) => path.to_owned(),
-            _ => match self.normalize(path) {
-                Some(p) => p,
-                None => return,
-            },
-        };
+        let Some(path) = self.recent_key(path) else { return };
         {
             let mut r = self.shared.recent.lock();
             r.retain(|p| p != &path);
@@ -380,13 +415,7 @@ impl ProjectIndex {
 
     /// Drops a file from Recent Files (Delete in the ⌘E popup).
     pub fn remove_recent(&self, path: &Path) {
-        let path = match path.to_str() {
-            Some(s) if ide_core::text::is_virtual_uri(s) => path.to_owned(),
-            _ => match self.normalize(path) {
-                Some(p) => p,
-                None => return,
-            },
-        };
+        let Some(path) = self.recent_key(path) else { return };
         {
             let mut r = self.shared.recent.lock();
             let before = r.len();
@@ -431,6 +460,20 @@ impl ProjectIndex {
 
     pub fn root(&self) -> &Path {
         &self.root
+    }
+
+    /// How Recent Files stores `path`: a virtual URI verbatim, a project file normalized,
+    /// and an existing file outside the root canonicalized. Excluded files under the root
+    /// are left out.
+    fn recent_key(&self, path: &Path) -> Option<PathBuf> {
+        if path.to_str().is_some_and(ide_core::text::is_virtual_uri) {
+            return Some(path.to_owned());
+        }
+        if let Some(p) = self.normalize(path) {
+            return Some(p);
+        }
+        let p = dunce::canonicalize(path).ok().filter(|p| p.is_file())?;
+        (!p.starts_with(&self.root)).then_some(p)
     }
 
     /// Absolute path inside the root (or a content root), or `None` for paths outside the project.
@@ -511,6 +554,7 @@ pub mod bench_support {
                         kind: if k % 3 == 0 { SymbolKind::Class } else { SymbolKind::Method },
                         container: (k % 3 != 0).then(|| format!("{w}{s}")),
                         range: Range::default(),
+                        bases: Vec::new(),
                     })
                     .collect();
                 let record = FileRecord { symbols, ..Default::default() };

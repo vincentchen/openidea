@@ -10,7 +10,6 @@ import {
   registerEditorKind,
   registerMenuGroup,
   registerOverlay,
-  registerSettingsPage,
   registerTitleItem,
   registerToolWindow,
 } from "@/workbench/contributions";
@@ -21,19 +20,21 @@ import { registerVcsActions } from "./actions";
 import { installChangelists } from "./changelists";
 import { registerHistoryActions, trackOperationContext } from "./historyActions";
 import { registerLogPaneActions } from "./logPaneActions";
-import { controlLabel, controlOperation, inProgress } from "./operations";
+import { controlLabel, controlOperation, inProgress, installOperationNoticeExpiry } from "./operations";
 import { annotationsShown, blameSlot } from "./blame";
 import { activateRevisionAnnotations } from "./annotateRevisionProvider";
 import { inlineBlame } from "./inlineBlame";
 import { BranchWidget, BranchesPopupHost, useBranchesPopup } from "./BranchWidget";
+import { SyncCommitsPopupHost } from "./SyncCommitsPopup";
 import { showConflictsDialog, takeContinueWhenResolved } from "./conflictsUi";
 import { registerCompareActions } from "./compare";
-import { DIFF_KIND, diffTitle, type DiffData } from "./diffInput";
+import { activateDiffViewer } from "./diffViewer";
 import { installDiffEditorHost } from "./DiffWindow";
 import { VcsDialogHost } from "./dialogs";
 import { changeMarkers } from "./gutter";
 import { installHunkPopup } from "./HunkPopup";
 import { LOCAL_HISTORY_KIND } from "./localHistoryKind";
+import { DIRECTORY_COMPARE_KIND, directoryCompareTitle, type DirectoryCompareData } from "./directoryCompareKind";
 import { SELECTION_HISTORY_KIND, type SelectionHistoryData } from "./selectionHistoryKind";
 import { registerLocalHistoryActions } from "./localHistoryActions";
 import { MERGE_KIND, type MergeData } from "./mergeKind";
@@ -52,6 +53,7 @@ import { installVcsStore, onConflictsAppeared, onConflictsCleared, useVcs } from
 import { installRootSync } from "./rootSync";
 import { tx } from "@/platform/i18n";
 import { openOnRemoteActions, registerOpenOnRemote } from "./openOnRemote";
+import { activateSettingsPages } from "./settingsPages";
 
 /** The Resolve/Continue/Abort buttons exist in the title bar only while there is something to resolve. */
 function trackMergeRebaseItem(): () => void {
@@ -152,31 +154,6 @@ function conflictsBody(names: string[]): string {
     : tx`${names.length} files have conflicts: ${list}`;
 }
 
-/** Settings › Version Control › Log (also used by the Settings window). */
-export { activateComparisonWindow, ComparisonWindow } from "./ComparisonWindow";
-export { activateDiffWindow, DiffWindow } from "./DiffWindow";
-
-/** The diff viewer (editor kind `diff`), also for windows that show diffs without Git (deployment). */
-export function activateDiffViewer(): () => void {
-  return registerEditorKind({
-    kind: DIFF_KIND,
-    standalone: true,
-    component: lazyComponent(() => import("./diff-editor-tab").then((m) => m.DiffEditorTab)),
-    title: (input) => diffTitle(input.data as DiffData),
-    icon: () => "diff",
-  });
-}
-
-export function activateSettingsPages(): () => void {
-  return registerSettingsPage({
-    id: "vcs.log",
-    title: "Log",
-    order: 6,
-    keywords: ["git log", "references", "tags", "columns", "commit time"],
-    component: lazyComponent(() => import("./LogSettingsPage").then((m) => m.LogSettingsPage)),
-  });
-}
-
 export function activate(): () => void {
   onConflictsAppeared((files) =>
     notifications().notify({
@@ -218,6 +195,7 @@ export function activate(): () => void {
   useCommit.setState({ signOff: workflowSettings().vcs.git.signOff });
   const disposers = [
     installVcsStore(),
+    installOperationNoticeExpiry(),
     installRootSync(),
     installGitLog(),
     installDiagnosticsTracking(),
@@ -249,6 +227,7 @@ export function activate(): () => void {
     installHunkPopup(),
     registerOverlay({ id: "vcs.dialogs", component: VcsDialogHost }),
     registerOverlay({ id: "vcs.branches", component: BranchesPopupHost }),
+    registerOverlay({ id: "vcs.syncCommits", component: SyncCommitsPopupHost }),
     activateConflictBanner(),
     activateConflictMarkers(),
     trackCommitWindow(),
@@ -296,6 +275,13 @@ export function activate(): () => void {
       component: lazyComponent(() => import("./MergeEditor").then((m) => m.MergeEditor)),
       title: (input) => `Merge: ${baseName((input.data as MergeData).path)}`,
       icon: () => "branch",
+    }),
+    registerEditorKind({
+      kind: DIRECTORY_COMPARE_KIND,
+      component: lazyComponent(() => import("./DirectoryCompare").then((m) => m.DirectoryCompareEditor)),
+      title: (input) => directoryCompareTitle(input.data as DirectoryCompareData),
+      icon: () => "diff",
+      restorable: true,
     }),
     registerEditorKind({
       kind: LOCAL_HISTORY_KIND,

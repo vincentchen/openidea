@@ -180,8 +180,14 @@ export const ICLS_ATTRIBUTES: Record<string, Array<[Part, string]>> = {
   MATCHED_BRACE_ATTRIBUTES: [["BACKGROUND", "--bg-matched-brace"]],
   SEARCH_RESULT_ATTRIBUTES: [["BACKGROUND", "--bg-search-result"]],
   TEXT_SEARCH_RESULT_ATTRIBUTES: [["BACKGROUND", "--bg-text-search-result"]],
-  IDENTIFIER_UNDER_CARET_ATTRIBUTES: [["BACKGROUND", "--bg-identifier-under-caret"]],
-  WRITE_IDENTIFIER_UNDER_CARET_ATTRIBUTES: [["BACKGROUND", "--bg-identifier-under-caret-write"]],
+  IDENTIFIER_UNDER_CARET_ATTRIBUTES: [
+    ["FOREGROUND", "--fg-identifier-under-caret"],
+    ["BACKGROUND", "--bg-identifier-under-caret"],
+  ],
+  WRITE_IDENTIFIER_UNDER_CARET_ATTRIBUTES: [
+    ["FOREGROUND", "--fg-identifier-under-caret-write"],
+    ["BACKGROUND", "--bg-identifier-under-caret-write"],
+  ],
   FOLDED_TEXT_ATTRIBUTES: [
     ["FOREGROUND", "--fg-fold-placeholder"],
     ["BACKGROUND", "--bg-fold-placeholder"],
@@ -198,6 +204,7 @@ export const ICLS_ATTRIBUTES: Record<string, Array<[Part, string]>> = {
   "PY.DOC_COMMENT_TAG": [["FOREGROUND", "--syn-python-docstring-tag"]],
   OPENIDEA_pyDocstringKeyword: [["FOREGROUND", "--syn-python-docstring-keyword"]],
   "PY.BUILTIN_NAME": [["FOREGROUND", "--syn-predefined"]],
+  "BASH.EXTERNAL_COMMAND": [["FOREGROUND", "--syn-shell-command"]],
   MARKDOWN_HEADER_LEVEL_1: [["FOREGROUND", "--syn-markup-heading"]],
   MARKDOWN_CODE_SPAN: [["FOREGROUND", "--syn-markup-code"]],
   MARKDOWN_LINK_TEXT: [["FOREGROUND", "--syn-link"]],

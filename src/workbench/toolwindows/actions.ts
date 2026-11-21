@@ -1,4 +1,4 @@
-import { registerAction, registerActions, type Action } from "@/platform/actions";
+import { registerAction, registerActions, retitleAction, type Action } from "@/platform/actions";
 import { setContext } from "@/platform/context";
 import { formatMessage, tx } from "@/platform/i18n";
 import { occurrenceNavigator, showStatusInfo, useContributions } from "../contributions";
@@ -10,8 +10,10 @@ import {
   deleteLayout,
   layoutNames,
   renameLayout,
+  restoreCurrentLayout,
   restoreDefaultLayout,
   restoreLayout,
+  saveCurrentLayout,
   saveLayout,
   useToolWindowLayouts,
 } from "./layouts";
@@ -25,6 +27,7 @@ import {
   lastUsedToolWindow,
   resizeActiveToolWindow,
   setToolWindowViewMode,
+  toolWindowsRestorable,
   useToolWindowLayout,
   toggleMaximizeToolWindow,
   viewModeOf,
@@ -91,6 +94,28 @@ function layoutActions(): Action[] {
         exitDistractionFree();
         const name = typeof arg === "string" ? arg : await pick("Restore Layout");
         if (name) restoreLayout(name);
+      },
+    },
+    {
+      id: "layout.restoreCurrent",
+      title: "Restore Current Layout",
+      description: "Restores the active saved layout, or the default layout when none is active.",
+      category: "Window",
+      keywords: ["tool window layout", "reset"],
+      when: "projectOpen",
+      run: () => {
+        exitDistractionFree();
+        restoreCurrentLayout();
+      },
+    },
+    {
+      id: "layout.saveCurrent",
+      title: "Save Changes in Current Layout",
+      category: "Window",
+      keywords: ["tool window layout", "store layout"],
+      when: "projectOpen && toolWindowLayoutActive",
+      run: () => {
+        saveCurrentLayout();
       },
     },
     {
@@ -175,7 +200,11 @@ export function installToolWindowActions(): () => void {
   const unsubscribe = useContributions.subscribe((s, prev) => {
     if (s.toolWindows !== prev.toolWindows) sync();
   });
-  const publishLayouts = () => setContext("toolWindowLayoutsSaved", useToolWindowLayouts.getState().layouts.length > 0);
+  const publishLayouts = () => {
+    const { layouts, active } = useToolWindowLayouts.getState();
+    setContext("toolWindowLayoutsSaved", layouts.length > 0);
+    setContext("toolWindowLayoutActive", !!active);
+  };
   publishLayouts();
   const unsubscribeLayouts = useToolWindowLayouts.subscribe(publishLayouts);
   /** The window an Options menu names, else the active one. */
@@ -185,7 +214,13 @@ export function installToolWindowActions(): () => void {
   };
 
   const disposeStatic = registerActions([
-    { id: "toolwindow.hideAll", title: "Hide All Tool Windows", category: "Window", run: hideAllToolWindows },
+    {
+      id: "toolwindow.hideAll",
+      title: "Hide All Tool Windows",
+      category: "Window",
+      keywords: ["restore tool windows"],
+      run: hideAllToolWindows,
+    },
     {
       id: "toolwindow.jumpToLast",
       title: "Jump to Last Tool Window",
@@ -284,9 +319,17 @@ export function installToolWindowActions(): () => void {
     })),
   ]);
 
+  // Pressed again with every window hidden, Hide All restores them: its title says so.
+  const retitleHideAll = () =>
+    retitleAction("toolwindow.hideAll", toolWindowsRestorable() ? "Restore Tool Windows" : undefined);
+  retitleHideAll();
+  const unsubscribeHideAll = useToolWindowLayout.subscribe(retitleHideAll);
+
   return () => {
     unsubscribe();
     unsubscribeLayouts();
+    unsubscribeHideAll();
+    retitleAction("toolwindow.hideAll", undefined);
     disposeStatic();
     perWindow.forEach((e) => e.dispose());
     perWindow.clear();

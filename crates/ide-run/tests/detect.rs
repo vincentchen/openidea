@@ -354,6 +354,8 @@ fn nested_builds_of_every_kind_and_depth() {
         ide_build::compile::BuildKind::Build,
         Some(&dir.path().join("services/api/app/src/main/kotlin/com/acme/Api.kt")),
         None,
+        None,
+        &ide_core::CancellationToken::new(),
     )
     .unwrap();
     assert_eq!(plan.steps[0].cwd, dir.path().join("services/api"));
@@ -397,6 +399,57 @@ fn spring_boot_applications_need_the_plugin_and_a_main() {
     ]);
     let c = detect(dir.path());
     assert!(!c.iter().any(|c| c.kind == "spring-boot"), "{:?}", ids(&c));
+}
+
+#[test]
+fn spring_boot_modules_inherit_the_plugin_from_their_parent_build() {
+    let main = |pkg: &str, ann: &str, cls: &str| {
+        format!("package {pkg};\n{ann}\npublic class {cls} {{\n  public static void main(String[] a) {{}}\n}}\n")
+    };
+    let parent = "<project><packaging>pom</packaging><modules><module>order</module><module>user</module>\
+                  <module>gateway</module></modules><build><plugins><plugin>\
+                  <artifactId>spring-boot-maven-plugin</artifactId></plugin></plugins></build></project>";
+    let order = main("shop.order", "@SpringBootApplication", "OrderApp");
+    let user = main("shop.user", "@SpringCloudApplication", "UserApp");
+    // A project annotation carrying @SpringBootApplication, declared in another module.
+    let gateway = main("shop.gateway", "@ShopApplication", "GatewayApp")
+        .replace("package shop.gateway;\n", "package shop.gateway;\nimport shop.common.ShopApplication;\n");
+    let annotation = "package shop.common;\n\nimport org.springframework.boot.autoconfigure.SpringBootApplication;\n\
+                      @Target(ElementType.TYPE)\n@SpringBootApplication\npublic @interface ShopApplication {}\n";
+    let files = [
+        ("pom.xml", parent.to_owned()),
+        ("order/pom.xml", "<project><artifactId>order</artifactId></project>".to_owned()),
+        ("order/src/main/java/shop/order/OrderApp.java", order),
+        ("user/pom.xml", "<project><artifactId>user</artifactId></project>".to_owned()),
+        ("user/src/main/java/shop/user/UserApp.java", user),
+        ("gateway/pom.xml", "<project><artifactId>gateway</artifactId></project>".to_owned()),
+        ("gateway/src/main/java/shop/gateway/GatewayApp.java", gateway),
+        ("common/src/main/java/shop/common/ShopApplication.java", annotation.to_owned()),
+    ];
+    let files: Vec<(&str, &str)> = files.iter().map(|(p, t)| (*p, t.as_str())).collect();
+    let c = detect(project(&files).path());
+    for id in [
+        "application:order:shop.order.OrderApp",
+        "application:user:shop.user.UserApp",
+        "application:gateway:shop.gateway.GatewayApp",
+    ] {
+        assert_eq!(find(&c, id).kind, "spring-boot", "{id}");
+    }
+
+    // A parent that only manages the plugin doesn't apply it; Gradle applies it from `subprojects`.
+    let dir = project(&[
+        ("pom.xml", PARENT_POM),
+        ("app/pom.xml", "<project/>"),
+        ("app/src/main/java/demo/App.java", &main("demo", "@SpringBootApplication", "App")),
+    ]);
+    assert!(!detect(dir.path()).iter().any(|c| c.kind == "spring-boot"));
+    let dir = project(&[
+        ("settings.gradle", "include 'app'\n"),
+        ("build.gradle", "subprojects {\n  apply plugin: 'org.springframework.boot'\n}\n"),
+        ("app/build.gradle", "dependencies {}\n"),
+        ("app/src/main/java/demo/App.java", &main("demo", "@SpringBootApplication", "App")),
+    ]);
+    assert_eq!(find(&detect(dir.path()), "application:app:demo.App").kind, "spring-boot");
 }
 
 #[test]
@@ -572,6 +625,20 @@ fn godot_projects_run_their_main_scene() {
     assert_eq!(demo.name, "Godot Project (demo)");
     assert_eq!(demo.cwd, Some(std::path::PathBuf::from("demo").into()));
     assert!(detect(project(&[("main.gd", "extends Node\n")]).path()).is_empty());
+}
+
+#[test]
+fn flutter_apps_run_their_entry_point() {
+    let pubspec = "name: app\ndependencies:\n  flutter:\n    sdk: flutter\n";
+    let dir = project(&[("pubspec.yaml", pubspec), ("lib/main.dart", "void main() {}\n")]);
+    let c = detect(dir.path());
+    let app = find(&c, "flutter:run");
+    assert_eq!(app.kind, "flutter");
+    assert_eq!(cmdline(app), "flutter run -t lib/main.dart");
+    assert_eq!(app.debug_adapter.as_deref(), Some("dart"));
+    // A Flutter package has no app to start, and a Dart package no Flutter.
+    assert!(detect(project(&[("pubspec.yaml", pubspec), ("lib/widgets.dart", "")]).path()).is_empty());
+    assert!(detect(project(&[("pubspec.yaml", "name: tool\n"), ("lib/main.dart", "")]).path()).is_empty());
 }
 
 #[test]
@@ -1205,4 +1272,22 @@ fn mix_projects() {
 
     let dir = project(&[("mix.exs", "defp deps do\n  [{:phoenix, \"~> 1.7\"}]\nend\n")]);
     assert_eq!(cmdline(&detect(dir.path())[0]), "iex -S mix phx.server");
+}
+
+#[test]
+fn sbt_projects() {
+    let dir = project(&[
+        ("build.sbt", "lazy val core = project\n"),
+        ("core/build.sbt", "libraryDependencies += \"a\" % \"b\" % \"1\"\n"),
+        ("core/src/main/scala/App.scala", "object App\n"),
+    ]);
+    let c = detect(dir.path());
+    assert_eq!(ids(&c), ["sbt:run", "sbt:test"]);
+    assert_eq!(cmdline(&c[0]), "sbt run");
+    assert!(c[1].is_test && c.iter().all(|c| c.kind == "sbt"));
+
+    let dir = project(&[("build.sbt", ""), ("sbt", "#!/bin/sh\n")]);
+    if !cfg!(windows) {
+        assert_eq!(cmdline(&detect(dir.path())[1]), "./sbt test");
+    }
 }

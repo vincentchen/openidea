@@ -11,7 +11,7 @@ import { call, commands, type Sdk } from "@/platform/ipc";
 import { IconButton, Input, type SelectOption, T } from "@/ui";
 import { JAVA_LANGUAGE_LEVELS, PHP_LANGUAGE_LEVELS } from "@/platform/languageSettings";
 import { GlobListEditor, Row, Section, Select, Toggle } from "../components/Form";
-import { choosePath } from "./api";
+import { choosePath } from "@/platform/choosePath";
 import { usePageContext, useSetting } from "../components/context";
 import { SdkField, tildify, useDetected, useJdtlsJdk } from "./components";
 import styles from "./Sdk.module.css";
@@ -93,7 +93,15 @@ function RunTargetRow({ language }: { language: "php" | "node" }) {
   );
 }
 
+const RUNTIME_OPTIONS: SelectOption[] = [
+  { value: "", label: "Auto", detail: "deno.json → Deno, bun.lock → Bun, else Node.js" },
+  { value: "node", label: "Node.js" },
+  { value: "bun", label: "Bun" },
+  { value: "deno", label: "Deno" },
+];
+
 export function NodePage() {
+  const [runtime, setRuntime] = useSetting<string>("languages.node.runtime");
   const [pm, setPm] = useSetting<string>("languages.node.packageManager");
   const { list } = useDetected("packageManager");
   const pmOptions = useMemo<SelectOption[]>(
@@ -113,6 +121,17 @@ export function NodePage() {
   return (
     <div className={styles.page}>
       <Section>
+        <Row
+          label="Preferred runtime"
+          hint="Runs JavaScript and TypeScript files from the gutter and the editor's Run action."
+        >
+          <Select value={runtime} options={RUNTIME_OPTIONS} onChange={setRuntime} aria-label="Preferred runtime" />
+        </Row>
+        <Row label="Package manager" hint="Used by the npm run configurations detected from package.json scripts.">
+          <Select value={pm} options={pmOptions} onChange={setPm} aria-label="Package manager" />
+        </Row>
+      </Section>
+      <Section title="Node.js">
         <SdkRow
           k="languages.node.interpreter"
           label="Node interpreter"
@@ -124,9 +143,6 @@ export function NodePage() {
           hint="Runs npm scripts and Node-based language servers (vtsls, eslint, pyright…)."
         />
         <RunTargetRow language="node" />
-        <Row label="Package manager" hint="Used by the npm run configurations detected from package.json scripts.">
-          <Select value={pm} options={pmOptions} onChange={setPm} aria-label="Package manager" />
-        </Row>
       </Section>
     </div>
   );
@@ -205,6 +221,7 @@ export function PhpPage() {
             emptyText="No include paths"
             itemLabel="Include path"
             aria-label="Include paths"
+            browse={{ directory: true, title: "Choose Include Path" }}
           />
         </Row>
         <Row
@@ -348,6 +365,7 @@ export function RustPage() {
 // Go
 
 export function GoPage() {
+  const [gofumpt, setGofumpt] = useSetting<boolean>("languages.go.gofumpt");
   const { list } = useDetected("go");
   const defaultGopath = list.find((s) => s.extra)?.extra;
   return (
@@ -371,6 +389,14 @@ export function GoPage() {
           label="Project GOPATH"
           placeholder={defaultGopath ? tildify(defaultGopath) : "go env GOPATH"}
           title="Select GOPATH"
+        />
+      </Section>
+      <Section title="Formatting">
+        <Toggle
+          label="Format with gofumpt"
+          checked={gofumpt}
+          onChange={setGofumpt}
+          hint="gopls applies gofumpt's stricter rules on top of gofmt when reformatting."
         />
       </Section>
     </div>
@@ -537,6 +563,7 @@ export function GradlePage() {
 export function MavenPage() {
   const [delegateBuild, setDelegateBuild] = useSetting<boolean>("languages.java.maven.delegateBuild");
   const [daemon, setDaemon] = useSetting<boolean>("languages.java.maven.daemon");
+  const [downloadSources, setDownloadSources] = useSetting<boolean>("languages.java.maven.downloadSources");
   const [threads, setThreads] = useSetting<string>("languages.java.maven.threads");
   const [activeProfiles, setActiveProfiles] = useSetting<string>("languages.java.maven.activeProfiles");
   const id = useId();
@@ -548,6 +575,12 @@ export function MavenPage() {
           checked={delegateBuild}
           onChange={setDelegateBuild}
           hint="Run and Debug build Maven modules with Maven (the project's javac) instead of the Java language server. Editor problems still come from the language server."
+        />
+        <Toggle
+          label="Automatically download sources"
+          checked={downloadSources}
+          onChange={setDownloadSources}
+          hint="The Java language server downloads the sources of all dependencies when it imports the project. When off, a library class opens decompiled and its Download Sources banner fetches the sources of that library only."
         />
         <SdkRow
           k="languages.java.maven.runnerJre"
@@ -648,6 +681,7 @@ export function MavenPage() {
 
 export function TypeScriptPage() {
   const [version, setVersion] = useSetting<string>("languages.typescript.version");
+  const [memory, setMemory] = useSetting<number>("languages.typescript.tsserverMaxMemory");
   const { list } = useDetected("typeScript");
   const workspace = list.find((s) => s.source === "workspace");
   const options = useMemo<SelectOption[]>(() => {
@@ -663,6 +697,17 @@ export function TypeScriptPage() {
       out.push({ value: version, label: tildify(version), detail: "custom" });
     return out;
   }, [workspace, version]);
+  const memoryOptions = useMemo<SelectOption[]>(
+    () => [
+      { value: "0", label: "Auto", detail: "8192 MB in Vue hybrid mode, else the server default" },
+      { value: "4096", label: "4096 MB" },
+      { value: "6144", label: "6144 MB" },
+      { value: "8192", label: "8192 MB" },
+      { value: "12288", label: "12288 MB" },
+      { value: "16384", label: "16384 MB" },
+    ],
+    [],
+  );
   return (
     <div className={styles.page}>
       <Section>
@@ -683,6 +728,40 @@ export function TypeScriptPage() {
             />
           </span>
         </Row>
+        <Row
+          label="tsserver memory limit"
+          hint="Heap limit of the TypeScript server (typescript.tsserver.maxTsServerMemory, in MB). Auto raises it for Vue projects, whose single program holds every .vue file's virtual TypeScript."
+        >
+          <Select
+            value={String(memory ?? 0)}
+            options={memoryOptions}
+            onChange={(v) => setMemory(Number(v))}
+            aria-label="tsserver memory limit"
+          />
+        </Row>
+      </Section>
+    </div>
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Zig
+
+export function ZigPage() {
+  return (
+    <div className={styles.page}>
+      <Section>
+        <SdkRow
+          k="languages.zig.zig"
+          label="Zig toolchain"
+          kind="zig"
+          emptyLabel="Auto"
+          emptyDetail="zig on PATH"
+          directory
+          browseTitle="Select Zig Directory"
+          aria-label="Zig toolchain"
+          hint="Zig whose standard library and build.zig.zon packages appear under External Libraries. ZLS must match this Zig version. PATH, Homebrew, zvm and mise / asdf installs are detected."
+        />
       </Section>
     </div>
   );

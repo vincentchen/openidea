@@ -3,17 +3,20 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { clearMocks, mockIPC } from "@tauri-apps/api/mocks";
 import { resetMermaidForTests } from "../viewers/markdown/mermaid";
 import { StrictMode } from "react";
+import { useProject } from "@/platform/project";
+import type { SymbolMatch } from "@/platform/ipc";
 import { Markdown, markdownBlocks, markdownHtml } from "./Markdown";
 
-const { openFile, openExternalUrl } = vi.hoisted(() => ({
+const { openFile, chooseDeclaration, openExternalUrl } = vi.hoisted(() => ({
   openFile: vi.fn().mockResolvedValue(undefined),
+  chooseDeclaration: vi.fn().mockResolvedValue(undefined),
   openExternalUrl: vi.fn().mockResolvedValue(undefined),
 }));
 const copyText = vi.hoisted(() => vi.fn());
 const readImage = vi.fn<(path: string) => Promise<string>>();
 const PIXEL = "data:image/gif;base64,R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7";
 vi.mock("@/workbench/contributions", () => ({
-  editorService: () => ({ openFile }),
+  editorService: () => ({ openFile, chooseDeclaration }),
 }));
 vi.mock("@/platform/openUrl", () => ({ openExternalUrl }));
 vi.mock("@/ui", async (importOriginal) => ({
@@ -104,6 +107,14 @@ it.each([
   ["/tmp/截图%20one.jpg", "/tmp/截图 one.jpg", undefined],
   ["/repo/main.rs:12:5", "/repo/main.rs", { line: 11, col: 4 }],
   ["/repo/main.rs#L7", "/repo/main.rs", { line: 6, col: 0 }],
+  ["E:/work/notes.md:773", "E:/work/notes.md", { line: 772, col: 0 }],
+  ["E:/work/my%20notes.md#L7", "E:/work/my notes.md", { line: 6, col: 0 }],
+  ["E:%5Cwork%5Cnotes.md:3:5", "E:/work/notes.md", { line: 2, col: 4 }],
+  ["E%3A%2Fwork%2Fnotes.md", "E:/work/notes.md", undefined],
+  ["E:/工作/笔记%20清单.md:3", "E:/工作/笔记 清单.md", { line: 2, col: 0 }],
+  ["/E:/work/spec.md", "E:/work/spec.md", undefined],
+  ["/E:/work/my%20notes.md#L7", "E:/work/my notes.md", { line: 6, col: 0 }],
+  ["%2FE:%5Cwork%5Cnotes.md:3:5", "E:/work/notes.md", { line: 2, col: 4 }],
 ])("opens a Markdown file link: %s", (href, path, selection) => {
   render(<Markdown text={`[查看文件](${href})`} cwd="/repo" />);
   fireEvent.click(screen.getByRole("link", { name: "查看文件" }));
@@ -118,15 +129,46 @@ it("keeps web links external", () => {
   expect(openFile).not.toHaveBeenCalled();
 });
 
-it.each(["#section", "//example.com/image.jpg", "javascript:alert(1)", "/tmp/%ZZ.jpg"])(
-  "does not open unsupported links as files: %s",
-  (href) => {
-    const { container } = render(<Markdown text={`[Link](${href})`} cwd="/repo" />);
-    fireEvent.click(container.querySelector("a")!);
-    expect(openFile).not.toHaveBeenCalled();
-    expect(openExternalUrl).not.toHaveBeenCalled();
-  },
-);
+it.each([
+  ["/E:/work/my%20notes.md#L7", "E:/work/my notes.md:7"],
+  ["/E:/work/spec.md:3:5", "E:/work/spec.md:3:5"],
+  ["docs/spec.md", "C:/repo/docs/spec.md"],
+  ["https://example.com/docs?q=1#section", "https://example.com/docs?q=1#section"],
+])("shows the full link target on hover: %s", (href, target) => {
+  render(<Markdown text={`[Details](${href})`} cwd="C:/repo" />);
+  expect(screen.getByRole("link", { name: "Details" })).toHaveAttribute("title", target);
+});
+
+it("keeps an explicit Markdown link title beside its target", () => {
+  render(<Markdown text={'[Details](docs/spec.md "Specification")'} cwd="C:/repo" />);
+  expect(screen.getByRole("link")).toHaveAttribute("title", "Specification\nC:/repo/docs/spec.md");
+});
+
+it.each([
+  "#section",
+  "//example.com/image.jpg",
+  "javascript:alert(1)",
+  "/tmp/%ZZ.jpg",
+  "E:relative.md",
+  "file:///E:/work/notes.md",
+  "%5C%5Cevil%5Cshare%5Cx.md",
+])("does not open unsupported links as files: %s", (href) => {
+  const { container } = render(<Markdown text={`[Link](${href})`} cwd="/repo" />);
+  fireEvent.click(container.querySelector("a")!);
+  expect(openFile).not.toHaveBeenCalled();
+  expect(openExternalUrl).not.toHaveBeenCalled();
+});
+
+it("does not preserve drive-letter URLs on elements other than file links", () => {
+  const { container } = render(
+    <Markdown
+      text={'<video src="E:/work/movie.mp4"></video><a href="javascript:alert(1)">Bad link</a>'}
+      cwd="C:/repo"
+    />,
+  );
+  expect(container.querySelector("video")).not.toHaveAttribute("src");
+  expect(container.querySelector("a")).not.toHaveAttribute("href");
+});
 
 it.each([
   ["/Users/thomas/vmos-shots/tiktok-home.jpg", "/repo", "/Users/thomas/vmos-shots/tiktok-home.jpg"],
@@ -327,6 +369,17 @@ describe("streamed replies", () => {
     expect(container.querySelector("details p")?.textContent).toBe("text");
   });
 
+  it("renders LaTeX math across streamed blocks", () => {
+    const text = "Inline $a + b$.\n\n$$\n\\frac{1}{2}\n$$\n\nTail";
+    const blocks = markdownBlocks(text);
+    expect(blocks).toHaveLength(3);
+    expect(blocks.join("")).toBe(text);
+    const { container } = render(<Markdown text={text} cwd="/repo" />);
+    expect(container.querySelectorAll(".katex")).toHaveLength(2);
+    expect(container.querySelector(".katex-display")).not.toBeNull();
+    expect(screen.queryByRole("button", { name: "Copy Code" })).toBeNull();
+  });
+
   it("cuts only what streamed on after the blocks that ended", () => {
     const before = markdownBlocks("One.\n\nTwo.\n\nThr");
     const after = markdownBlocks("One.\n\nTwo.\n\nThree.\n\n- a", before);
@@ -347,5 +400,88 @@ describe("streamed replies", () => {
     expect(screen.getAllByRole("button", { name: "Copy Code" })).toHaveLength(1);
     rerender(<Markdown text="Something else" cwd="/repo" />);
     expect(container.textContent?.trim()).toBe("Something else");
+  });
+});
+
+describe("symbol links", () => {
+  const symbol = (name: string, path: string, line: number): SymbolMatch => ({
+    name,
+    kind: "class",
+    container: null,
+    path,
+    relPath: path.slice("/repo/".length),
+    range: { start: { line, col: 6 }, end: { line, col: 6 + name.length } },
+    score: 0,
+    indices: [],
+  });
+  const index = [
+    symbol("FooView", "/repo/src/view.ts", 4),
+    symbol("BarView", "/repo/src/bar.ts", 1),
+    symbol("BarView", "/repo/web/bar.ts", 9),
+    symbol("StreamView", "/repo/src/stream.ts", 2),
+    symbol("SinkView", "/repo/src/sink.ts", 1),
+    symbol("SinkView", "/repo/web/sink.ts", 7),
+  ];
+  let lookups: string[][];
+
+  beforeEach(() => {
+    lookups = [];
+    useProject.setState({ project: { root: "/repo" } as never });
+    mockIPC((cmd, args) => {
+      if (cmd === "fs_probe") throw new Error("missing");
+      if (cmd !== "find_symbols_named") return null;
+      const { names } = args as { names: string[] };
+      lookups.push(names);
+      return index.filter((symbol) => names.includes(symbol.name));
+    });
+  });
+  afterEach(() => useProject.setState({ project: null }));
+
+  const code = (container: HTMLElement, text: string) =>
+    [...container.querySelectorAll<HTMLElement>("code")].find((span) => span.textContent === text)!;
+
+  it("opens the one definition a name has, and leaves other code plain", async () => {
+    const { container } = render(<Markdown text={"`FooView` runs `cargo test`, see `Missing`."} cwd="/repo/one" />);
+    await waitFor(() => expect(code(container, "FooView").dataset.path).toBe("/repo/src/view.ts"));
+    expect(code(container, "cargo test").dataset.path).toBeUndefined();
+    expect(code(container, "Missing").dataset.path).toBeUndefined();
+    expect(lookups).toEqual([["FooView", "Missing"]]);
+    fireEvent.click(code(container, "FooView"));
+    expect(openFile).toHaveBeenCalledWith("/repo/src/view.ts", { focus: true, selection: { line: 4, col: 6 } });
+  });
+
+  it("looks a streamed reply's names up once, after its text settles", async () => {
+    const reply = "First `StreamView`.\n\nThen `SinkView` in `web/sink.ts` and `StreamView` again.";
+    const { container, rerender } = render(<Markdown text={reply.slice(0, 10)} cwd="/repo/two" />);
+    for (let end = 12; end <= reply.length; end += 6) rerender(<Markdown text={reply.slice(0, end)} cwd="/repo/two" />);
+    rerender(<Markdown text={reply} cwd="/repo/two" />);
+    await waitFor(() => expect(code(container, "SinkView").dataset.path).toBe("/repo/web/sink.ts"));
+    expect(lookups).toEqual([["StreamView", "SinkView"]]);
+    rerender(<Markdown text={`${reply}\n\nDone with \`StreamView\`.`} cwd="/repo/two" />);
+    await new Promise((resolve) => setTimeout(resolve, 600));
+    expect(lookups).toHaveLength(1);
+  });
+
+  it("shows Go to Declaration's chooser when several files define the name", async () => {
+    const { container } = render(<Markdown text={"Both define `BarView`."} cwd="/repo" />);
+    await waitFor(() => expect(code(container, "BarView").className).not.toBe(""));
+    expect(code(container, "BarView").dataset.path).toBeUndefined();
+    fireEvent.click(code(container, "BarView"));
+    expect(openFile).not.toHaveBeenCalled();
+    expect(chooseDeclaration).toHaveBeenCalledWith(
+      [expect.objectContaining({ path: "/repo/src/bar.ts" }), expect.objectContaining({ path: "/repo/web/bar.ts" })],
+      "BarView",
+      expect.objectContaining({ x: expect.any(Number), y: expect.any(Number) }),
+    );
+  });
+
+  it("keeps a file a span names over a symbol of the same name", async () => {
+    mockIPC((cmd, args) => {
+      if (cmd === "fs_probe") return null;
+      if (cmd === "find_symbols_named") lookups.push((args as { names: string[] }).names);
+      return null;
+    });
+    const { container } = render(<Markdown text={"Open `Config.load`."} cwd="/repo/three" />);
+    await waitFor(() => expect(code(container, "Config.load").dataset.path).toBe("/repo/three/Config.load"));
   });
 });

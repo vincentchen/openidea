@@ -21,13 +21,16 @@ import {
 import { tx } from "@/platform/i18n";
 import { useProject } from "@/platform/project";
 
+import { flutterType } from "./flutterType";
 import { tomcatType } from "./tomcat";
 import { goBuildType, goTestType } from "./goTypes";
 
 import { dotnetProjectType, dotnetTestType } from "./dotnetTypes";
 import { rakeType, rspecType, rubyScriptType } from "./rubyTypes";
 import { djangoTestType } from "./djangoTypes";
+import { pythonType } from "./pythonTypes";
 import { phpunitType } from "./phpunitTypes";
+import { UNITY_CONFIG_KIND } from "./unity";
 
 export const COMPOUND = "compound";
 
@@ -240,7 +243,7 @@ const npm: RunConfigTypeContribution = {
       mono: true,
       browse: "file",
       placeholder: "Project default",
-      hint: "The node executable this script runs on; empty uses Settings › Languages & Frameworks › Node.js.",
+      hint: "The node executable this script runs on; empty uses Settings › Languages & Frameworks › JavaScript Runtime.",
     },
   ],
   commandLine(p) {
@@ -475,6 +478,14 @@ const pytest: RunConfigTypeContribution = {
 };
 
 export const BUILTIN_TYPES: readonly RunConfigTypeContribution[] = [
+  {
+    id: UNITY_CONFIG_KIND,
+    label: "Unity Editor",
+    icon: "attach-to-process",
+    debugOnly: true,
+    fields: [],
+    commandLine: () => null,
+  },
   shell,
   program,
   npm,
@@ -482,6 +493,8 @@ export const BUILTIN_TYPES: readonly RunConfigTypeContribution[] = [
   gradle,
   maven,
   godot,
+  flutterType,
+  pythonType,
   pytest,
   rubyScriptType,
   rakeType,

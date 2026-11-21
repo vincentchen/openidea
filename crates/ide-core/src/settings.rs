@@ -42,12 +42,16 @@ pub struct Settings {
     pub terminal: TerminalSettings,
     pub actions_on_save: ActionsOnSaveSettings,
     pub external_tools: Vec<ExternalTool>,
+    /// Tools › Diff & Merge › External Diff Tools.
+    pub external_diff: ExternalDiffSettings,
     /// Language servers / debug adapters at a user-chosen location, by the
     /// command the language definition launches (`elixir-ls`, `codelldb`).
     pub tools: BTreeMap<String, ToolSettings>,
     /// Per language server, by name (`rust-analyzer`): launch and protocol
     /// options on top of the language definition, or a server defined here.
     pub language_servers: BTreeMap<String, LanguageServerSettings>,
+    /// Tools › Download sources: a mirror prefix for the release archives the installer fetches.
+    pub tool_downloads: ToolDownloadSettings,
     /// Editor › Inspections profiles.
     pub inspections: InspectionSettings,
     /// Editor › Natural Languages › Spelling.
@@ -65,6 +69,12 @@ pub struct Settings {
     pub mcp_server: McpServerSettings,
     /// Tools › Agents: Command Execution Policy.
     pub agent_security: AgentSecuritySettings,
+    /// Appearance & Behavior › Scopes: named file sets other settings refer to.
+    pub scopes: Vec<NamedScope>,
+    /// Appearance & Behavior › File Colors.
+    pub file_colors: FileColorSettings,
+    /// Database › Query Execution, Languages & Frameworks › SQL Resolution Scopes.
+    pub database: DatabaseSettings,
     /// Plugin settings (`[contributes.settings]`): plugin id → its values by key.
     #[specta(type = BTreeMap<String, BTreeMap<String, specta_typescript::Unknown>>)]
     pub plugins: BTreeMap<String, serde_json::Map<String, serde_json::Value>>,
@@ -86,6 +96,18 @@ pub struct AgentSettings {
     pub fold_turns: bool,
     /// Streaming text is revealed at a steady pace rather than chunk by chunk.
     pub smooth_text: bool,
+    /// Conversations and the composer expand to the full width of the pane instead of staying in a centred column.
+    pub fit_window_width: bool,
+    /// While the agent works, playful words fill the pauses in what it reports.
+    pub playful_status: bool,
+    /// Seconds the agent reports nothing new before the playful words take over; 0 shows them
+    /// from the start.
+    pub playful_after_seconds: u32,
+    /// The user's playful words by activity (`working`, `thinking`, `reading`, …), replacing
+    /// the built-in ones of that activity; an empty list keeps its status factual.
+    #[serde(deserialize_with = "or_default")]
+    #[specta(type = BTreeMap<String, Vec<String>>)]
+    pub playful_words: BTreeMap<String, Vec<String>>,
     #[serde(deserialize_with = "or_default")]
     #[specta(type = ThinkingDisplay)]
     pub thinking: ThinkingDisplay,
@@ -127,6 +149,10 @@ impl Default for AgentSettings {
             show_cost: false,
             fold_turns: true,
             smooth_text: true,
+            fit_window_width: false,
+            playful_status: false,
+            playful_after_seconds: 0,
+            playful_words: BTreeMap::new(),
             thinking: ThinkingDisplay::Auto,
             tool_calls: ToolCallDisplay::Grouped,
             expand_tool_output: false,
@@ -200,16 +226,20 @@ where
     Ok(serde_json::from_value(serde_json::Value::deserialize(d)?).unwrap_or_default())
 }
 
+/// The built-in themes that were removed (#2981; the One Dark Pro plugin
+/// maintains their look) and the built-in that stands in for each: read by
+/// [`theme_id`], and the removal notice looks for them in settings files.
+pub const REMOVED_THEMES: [(&str, &str); 2] = [("one-light", "light"), ("one-dark", "dark")];
+
 /// A theme id, with the built-in themes that were removed read as the Islands theme of their kind.
 fn theme_id<'de, D>(d: D) -> Result<String, D::Error>
 where
     D: serde::Deserializer<'de>,
 {
     let id = String::deserialize(d)?;
-    Ok(match id.as_str() {
-        "one-light" => "light".into(),
-        "one-dark" => "dark".into(),
-        _ => id,
+    Ok(match REMOVED_THEMES.iter().find(|(removed, _)| *removed == id.as_str()) {
+        Some((_, stand_in)) => (*stand_in).to_owned(),
+        None => id,
     })
 }
 
@@ -331,6 +361,22 @@ impl Default for McpServerSettings {
             fixed_token: false,
         }
     }
+}
+
+/// Tools › Download sources: a mirror the installer tries when `github.com` is slow or
+/// unreachable.
+///
+/// The mirror is a proxy prefix: the official URL is appended to it unchanged
+/// (`https://mirror.example/https://github.com/o/r/releases/download/…`), which is what the
+/// public GitHub proxies speak. Only `github.com` downloads are affected — those proxies
+/// hard-code that host, so Eclipse JDT LS and Open VSX keep their official addresses. Empty by
+/// default, so every download stays on its official host until the user opts in.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct ToolDownloadSettings {
+    /// Proxy prefix prepended to `https://github.com/…` archive addresses only; empty keeps
+    /// every download on its official host.
+    pub github_mirror: String,
 }
 
 /// Absent profiles retain automatic discovery for existing projects.
@@ -466,10 +512,12 @@ impl Default for Settings {
             debugger: DebuggerSettings::default(),
             run: RunSettings::default(),
             terminal: TerminalSettings::default(),
+            external_diff: ExternalDiffSettings::default(),
             actions_on_save: ActionsOnSaveSettings::default(),
             external_tools: Vec::new(),
             tools: BTreeMap::new(),
             language_servers: BTreeMap::new(),
+            tool_downloads: ToolDownloadSettings::default(),
             inspections: InspectionSettings::default(),
             spelling: SpellingSettings::default(),
             ssh: SshSettings::default(),
@@ -479,6 +527,9 @@ impl Default for Settings {
             agents: AgentSettings::default(),
             mcp_server: McpServerSettings::default(),
             agent_security: AgentSecuritySettings::default(),
+            scopes: Vec::new(),
+            file_colors: FileColorSettings::default(),
+            database: DatabaseSettings::default(),
             plugins: BTreeMap::new(),
         }
     }
@@ -487,6 +538,47 @@ impl Default for Settings {
 /// IDEA's keymap for the OS (`src/platform/keymaps/`).
 fn default_keymap() -> &'static str {
     if cfg!(target_os = "macos") { "intellij-macos" } else { "intellij-windows" }
+}
+
+/// A named set of files: `file:src//*.ts && !file:*.test.ts` (project-relative path patterns
+/// joined with `||`, `&&`, `!` and parentheses).
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct NamedScope {
+    pub name: String,
+    pub pattern: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FileColorSettings {
+    pub enabled: bool,
+    pub editor_tabs: bool,
+    pub project_view: bool,
+    /// Scope → colour; the first scope that holds a file gives its colour.
+    pub colors: Vec<FileColor>,
+}
+
+impl Default for FileColorSettings {
+    fn default() -> Self {
+        let color = |scope: &str, color: &str| FileColor { scope: scope.into(), color: color.into() };
+        Self {
+            enabled: true,
+            editor_tabs: true,
+            project_view: true,
+            colors: vec![color("Non-Project Files", "yellow"), color("Tests", "green")],
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct FileColor {
+    /// A built-in scope (`Tests`, `Production`, `Project Files`, `Non-Project Files`) or a
+    /// `scopes` entry, by name.
+    pub scope: String,
+    /// A palette name (`blue`, `green`, `orange`, `rose`, `violet`, `yellow`, `gray`) or `#rrggbb`.
+    pub color: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
@@ -577,13 +669,39 @@ impl Default for DateFormatSettings {
 pub struct NotificationSettings {
     pub balloons: bool,
     pub sound: bool,
+    /// Mirror balloon notifications to the OS when no OpenIDEA window is focused.
+    #[serde(default = "default_true")]
+    pub system_notifications: bool,
+    /// Terminal command completions (#3712): `off` | `longRunning` | `all`.
+    pub terminal_completion: String,
+    /// `longRunning`: the run time a finished command must reach, in seconds.
+    pub terminal_threshold_seconds: u32,
     /// Group id → display; groups not listed use their default.
     pub groups: BTreeMap<String, NotificationGroupSettings>,
 }
 
+fn default_true() -> bool {
+    true
+}
+
+fn default_terminal_completion() -> String {
+    "longRunning".to_owned()
+}
+
+fn default_terminal_threshold_seconds() -> u32 {
+    10
+}
+
 impl Default for NotificationSettings {
     fn default() -> Self {
-        Self { balloons: true, sound: false, groups: BTreeMap::new() }
+        Self {
+            balloons: true,
+            sound: false,
+            system_notifications: true,
+            terminal_completion: default_terminal_completion(),
+            terminal_threshold_seconds: default_terminal_threshold_seconds(),
+            groups: BTreeMap::new(),
+        }
     }
 }
 
@@ -653,6 +771,8 @@ pub struct AppearanceSettings {
     pub compact_mode: bool,
     /// IDEA "Use smaller indents in trees": tool window trees indent less per level.
     pub small_tree_indents: bool,
+    /// Linux: WebKit animates each mouse wheel step
+    pub smooth_scrolling: bool,
     pub full_path_in_title: bool,
     pub project_colors_in_toolbar: bool,
     pub dnd_with_alt_only: bool,
@@ -661,6 +781,9 @@ pub struct AppearanceSettings {
     pub main_menu_style: String,
     /// A lone Alt press focuses or opens the main menu (IDEA `ide.windows.main.menu.focus.on.alt`).
     pub main_menu_alt: bool,
+    /// Settings open in a native window of their own (IDEA parity); off opens them
+    /// as a dialog inside the project window, which needs no new webview.
+    pub settings_in_separate_window: bool,
     /// `subpixel` | `greyscale` | `none`
     pub ide_antialiasing: String,
     pub editor_antialiasing: String,
@@ -668,6 +791,8 @@ pub struct AppearanceSettings {
     pub show_tool_window_names: bool,
     pub show_tool_window_badges: bool,
     pub widescreen_tool_windows: bool,
+    /// Each tool window keeps its own size; off, the windows of a side share one.
+    pub remember_tool_window_sizes: bool,
     /// View › Appearance › Toolbar; hidden leaves IDEA's compact window header.
     pub show_main_toolbar: bool,
     pub show_status_bar: bool,
@@ -681,6 +806,35 @@ pub struct AppearanceSettings {
     pub main_toolbar: Option<MainToolbarSettings>,
     /// Appearance › Background Image: an image shown through the IDE window.
     pub background_image: BackgroundImageSettings,
+    /// Appearance › Presentation Assistant: the name and shortcut of each action run.
+    pub presentation_assistant: PresentationAssistantSettings,
+}
+
+/// Appearance › Presentation Assistant: shows the name and shortcut of each action the user runs.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct PresentationAssistantSettings {
+    pub enabled: bool,
+    /// `small` | `medium` | `large`.
+    pub size: String,
+    /// How long each popup stays, in seconds.
+    pub duration_seconds: u32,
+    /// `top-left`, `top`, `top-right`, `bottom-left`, `bottom` or `bottom-right` of the window.
+    pub position: String,
+    /// Also show the shortcut of the other platform's keymap (macOS ⇄ Windows/Linux).
+    pub alternate_keymap: bool,
+}
+
+impl Default for PresentationAssistantSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            size: "medium".into(),
+            duration_seconds: 4,
+            position: "bottom".into(),
+            alternate_keymap: false,
+        }
+    }
 }
 
 /// Appearance › Background Image. An empty `path` shows no image.
@@ -754,24 +908,28 @@ impl Default for AppearanceSettings {
             different_tool_window_background: false,
             compact_mode: false,
             small_tree_indents: false,
+            smooth_scrolling: true,
             full_path_in_title: false,
             project_colors_in_toolbar: true,
             dnd_with_alt_only: false,
             menu_icons: true,
             main_menu_style: "hamburger".into(),
             main_menu_alt: true,
+            settings_in_separate_window: true,
             ide_antialiasing: "greyscale".into(),
             editor_antialiasing: "greyscale".into(),
             show_tool_window_bars: true,
             show_tool_window_names: false,
             show_tool_window_badges: true,
             widescreen_tool_windows: false,
+            remember_tool_window_sizes: false,
             show_main_toolbar: true,
             show_status_bar: true,
             navigation_bar: NavigationBarPosition::StatusBar,
             status_bar_widgets: BTreeMap::new(),
             main_toolbar: None,
             background_image: BackgroundImageSettings::default(),
+            presentation_assistant: PresentationAssistantSettings::default(),
         }
     }
 }
@@ -812,7 +970,13 @@ pub struct EditorSettings {
     pub docstring_format: String,
     /// Color Scheme › Language Defaults › Rainbow brackets: `()`, `[]`, `{}` coloured by depth.
     pub rainbow_brackets: bool,
+    /// The bracket kinds rainbow brackets colour.
+    pub rainbow_bracket_kinds: RainbowBracketKinds,
+    /// Colours the rainbow bracket depth cycles through (2–5).
+    pub rainbow_bracket_colors: u32,
     pub ligatures: bool,
+    /// Editor › Font and Tools › Terminal › Font: the font pickers list only monospaced fonts.
+    pub only_monospaced_fonts: bool,
     /// Fallback font for glyphs the main font lacks; empty = none.
     pub fallback_font: String,
     /// Typography Settings › Main font weight (CSS 100–900), as IDEA.
@@ -856,7 +1020,10 @@ impl Default for EditorSettings {
             semantic_highlighting: false,
             docstring_format: "rest".into(),
             rainbow_brackets: false,
+            rainbow_bracket_kinds: RainbowBracketKinds::default(),
+            rainbow_bracket_colors: 3,
             ligatures: false,
+            only_monospaced_fonts: true,
             fallback_font: String::new(),
             font_weight: 400,
             bold_font_weight: 700,
@@ -876,6 +1043,23 @@ impl Default for EditorSettings {
             code_style: CodeStyleSettings::default(),
             encodings: EncodingSettings::default(),
         }
+    }
+}
+
+/// Color Scheme › Language Defaults › Rainbow brackets: which delimiters are coloured.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
+pub struct RainbowBracketKinds {
+    pub round: bool,
+    pub square: bool,
+    pub curly: bool,
+    /// Type argument / parameter delimiters and markup tags, where the syntax tree marks them.
+    pub angle: bool,
+}
+
+impl Default for RainbowBracketKinds {
+    fn default() -> Self {
+        Self { round: true, square: true, curly: true, angle: false }
     }
 }
 
@@ -970,6 +1154,7 @@ pub struct LanguagesSettings {
     pub ruby: RubySettings,
     pub markdown: MarkdownSettings,
     pub arduino: ArduinoSettings,
+    pub zig: ZigSettings,
 }
 
 impl Default for LanguagesSettings {
@@ -992,6 +1177,7 @@ impl Default for LanguagesSettings {
             ruby: RubySettings::default(),
             markdown: MarkdownSettings::default(),
             arduino: ArduinoSettings::default(),
+            zig: ZigSettings::default(),
         }
     }
 }
@@ -1092,7 +1278,8 @@ impl Default for ExternalFormatterSettings {
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
 pub struct PythonSettings {
-    /// Project interpreter executable; empty = auto-detect (project venv, else `python3`).
+    /// Project interpreter executable; empty = auto-detect (project venv, else `python3`);
+    /// `target:<run-target-id>` = the Python of a Docker or Compose run target.
     pub interpreter: String,
     /// Activate the interpreter's virtualenv in new terminal sessions.
     pub activate_virtualenv: bool,
@@ -1118,6 +1305,17 @@ impl Default for PythonSettings {
             hide_other_project_interpreters: false,
             show_interpreter_paths: true,
         }
+    }
+}
+
+impl PythonSettings {
+    /// What `interpreter` starts with when the project interpreter is a run target's.
+    pub const TARGET_PREFIX: &str = "target:";
+
+    /// The run target whose Python is the project interpreter (`target:<id>`), if one is.
+    pub fn run_target(&self) -> Option<&str> {
+        let id = self.interpreter.trim().strip_prefix(Self::TARGET_PREFIX)?.trim();
+        (!id.is_empty()).then_some(id)
     }
 }
 
@@ -1159,6 +1357,9 @@ pub struct NodeSettings {
     pub run_target: String,
     /// `npm` | `pnpm` | `yarn`; empty = detect from the lock file / `packageManager`.
     pub package_manager: String,
+    /// Runtime for running JavaScript / TypeScript files: `node` | `bun` | `deno`; empty = from the
+    /// project (`deno.json` → Deno, `bun.lock` → Bun, else Node.js).
+    pub runtime: String,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize, Type)]
@@ -1190,11 +1391,20 @@ impl Default for RustSettings {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
 #[serde(default, rename_all = "camelCase")]
+pub struct ZigSettings {
+    /// Directory holding the `zig` executable; empty = the one on `PATH`.
+    pub zig: String,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize, Type)]
+#[serde(default, rename_all = "camelCase")]
 pub struct GoSettings {
     /// Empty = the `go` on `PATH`.
     pub goroot: String,
     /// Empty = `go env GOPATH`.
     pub gopath: String,
+    /// Format with gofumpt, a stricter gofmt (gopls `gofumpt`).
+    pub gofumpt: bool,
     pub build_tags: GoBuildTags,
     pub modules: GoModules,
 }
@@ -1243,6 +1453,9 @@ pub struct JavaSettings {
     pub jdtls_vm_args: String,
     /// Share one JDT LS across builds in an ordinary project window; other windows remain separate.
     pub jdtls_shared: bool,
+    /// JDK homes added by hand (Platform Settings › SDKs › Add JDK from Disk…), listed with the
+    /// detected ones.
+    pub added_jdks: Vec<String>,
     /// Build Tools › Maven.
     pub maven: MavenSettings,
     /// Build Tools › Gradle.
@@ -1318,6 +1531,10 @@ pub struct MavenSettings {
     pub active_profiles: String,
     /// Delegate IDE build/run actions to Maven: launches build with Maven (`javac`) instead of jdtls (ECJ).
     pub delegate_build: bool,
+    /// Download `-sources.jar` of dependencies when the Java language server imports the
+    /// project (jdtls `java.maven.downloadSources`). Off: sources are fetched on demand
+    /// from a library class's Download Sources banner.
+    pub download_sources: bool,
 }
 
 impl MavenSettings {
@@ -1355,11 +1572,15 @@ pub struct TypeScriptSettings {
     /// `bundled` (the server's own TypeScript), `workspace` (`node_modules/typescript`),
     /// or a path to a TypeScript `lib` directory.
     pub version: String,
+    /// tsserver heap limit in MB. `0` = automatic: 8192 when vtsls hosts the Vue
+    /// plugin (hybrid mode; a Vue project's program alone needs ~3 GiB, and the
+    /// vtsls default 3072 dies in a GC death spiral), else unset (vtsls default).
+    pub tsserver_max_memory: u32,
 }
 
 impl Default for TypeScriptSettings {
     fn default() -> Self {
-        Self { version: "bundled".into() }
+        Self { version: "bundled".into(), tsserver_max_memory: 0 }
     }
 }
 
@@ -1536,6 +1757,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn python_interpreter_may_name_a_run_target() {
+        let python = |interpreter: &str| PythonSettings { interpreter: interpreter.into(), ..Default::default() };
+        assert_eq!(python("target:web").run_target(), Some("web"));
+        assert_eq!(python(" target: web ").run_target(), Some("web"));
+        for local in ["", "target:", "/usr/bin/python3", ".venv/bin/python", "targets/python"] {
+            assert_eq!(python(local).run_target(), None, "{local}");
+        }
+    }
+
+    #[test]
     fn removed_one_themes_read_as_islands_themes() {
         let settings: Settings = serde_json::from_str(
             r#"{"appearance":{"theme":"one-dark","preferredLightTheme":"one-light","preferredDarkTheme":"one-dark"}}"#,
@@ -1546,6 +1777,16 @@ mod tests {
         assert_eq!(a.preferred_dark_theme, "dark");
         let kept: Settings = serde_json::from_str(r#"{"appearance":{"theme":"solarized-dark"}}"#).unwrap();
         assert_eq!(kept.appearance.theme, "solarized-dark");
+    }
+
+    #[test]
+    fn smooth_scrolling_defaults_on_and_round_trips() {
+        let old: Settings = serde_json::from_str(r#"{"appearance":{"zoom":110}}"#).unwrap();
+        assert!(old.appearance.smooth_scrolling);
+        let off: Settings = serde_json::from_str(r#"{"appearance":{"smoothScrolling":false}}"#).unwrap();
+        assert!(!off.appearance.smooth_scrolling);
+        let json = serde_json::to_value(&off).unwrap();
+        assert_eq!(json["appearance"]["smoothScrolling"], false);
     }
 
     #[test]
@@ -1631,6 +1872,41 @@ mod tests {
     }
 
     #[test]
+    fn rainbow_bracket_options_default_and_round_trip() {
+        let old: Settings = serde_json::from_str(r#"{"editor":{"rainbowBrackets":true}}"#).unwrap();
+        assert!(old.editor.rainbow_brackets);
+        assert_eq!(old.editor.rainbow_bracket_kinds, RainbowBracketKinds::default());
+        assert_eq!(old.editor.rainbow_bracket_colors, 3);
+        let defaults = Settings::default().editor;
+        assert!(!defaults.rainbow_brackets);
+        let kinds = defaults.rainbow_bracket_kinds;
+        assert!(kinds.round && kinds.square && kinds.curly && !kinds.angle);
+
+        let mut settings = Settings::default();
+        settings.editor.rainbow_bracket_kinds =
+            RainbowBracketKinds { round: false, square: true, curly: true, angle: true };
+        settings.editor.rainbow_bracket_colors = 5;
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["editor"]["rainbowBracketKinds"]["angle"], true);
+        assert_eq!(json["editor"]["rainbowBracketColors"], 5);
+        let restored: Settings = serde_json::from_value(json).unwrap();
+        assert_eq!(restored.editor.rainbow_bracket_kinds, settings.editor.rainbow_bracket_kinds);
+        assert_eq!(restored.editor.rainbow_bracket_colors, 5);
+    }
+
+    #[test]
+    fn only_monospaced_fonts_defaults_on_and_round_trips() {
+        let old: Settings = serde_json::from_str(r#"{"editor":{"ligatures":true}}"#).unwrap();
+        assert!(old.editor.only_monospaced_fonts);
+        let mut settings = Settings::default();
+        settings.editor.only_monospaced_fonts = false;
+        let json = serde_json::to_value(&settings).unwrap();
+        assert_eq!(json["editor"]["onlyMonospacedFonts"], false);
+        let restored: Settings = serde_json::from_value(json).unwrap();
+        assert!(!restored.editor.only_monospaced_fonts);
+    }
+
+    #[test]
     fn docstring_format_defaults_and_round_trips() {
         let old: Settings = serde_json::from_str(r#"{"editor":{"semanticHighlighting":true}}"#).unwrap();
         assert_eq!(old.editor.docstring_format, "rest");
@@ -1686,11 +1962,15 @@ mod tests {
         let old: Settings = serde_json::from_str(r#"{"agents":{"showCost":true}}"#).unwrap();
         assert!(old.agents.show_cost);
         assert!(old.agents.show_context_usage && old.agents.show_work_time && old.agents.show_usage_limits);
+        assert!(!old.agents.fit_window_width);
         assert!(!Settings::default().agents.show_cost);
+        assert!(!Settings::default().agents.fit_window_width);
         let mut settings = Settings::default();
         settings.agents.show_usage_limits = false;
+        settings.agents.fit_window_width = true;
         let json = serde_json::to_value(&settings).unwrap();
         assert_eq!(json["agents"]["showUsageLimits"], false);
+        assert_eq!(json["agents"]["fitWindowWidth"], true);
         let restored: Settings = serde_json::from_value(json).unwrap();
         assert_eq!(restored.agents, settings.agents);
     }
@@ -1722,6 +2002,15 @@ mod tests {
         let off: Settings = serde_json::from_str(r#"{"appearance":{"mainMenuAlt":false}}"#).unwrap();
         assert!(!off.appearance.main_menu_alt);
         assert_eq!(serde_json::to_value(off).unwrap()["appearance"]["mainMenuAlt"], false);
+    }
+
+    #[test]
+    fn settings_open_in_a_separate_window_unless_turned_off() {
+        let old: Settings = serde_json::from_str(r#"{"appearance":{"compactMode":true}}"#).unwrap();
+        assert!(old.appearance.settings_in_separate_window);
+        let off: Settings = serde_json::from_str(r#"{"appearance":{"settingsInSeparateWindow":false}}"#).unwrap();
+        assert!(!off.appearance.settings_in_separate_window);
+        assert_eq!(serde_json::to_value(off).unwrap()["appearance"]["settingsInSeparateWindow"], false);
     }
 
     #[test]

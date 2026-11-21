@@ -38,9 +38,24 @@ pub enum IdeEvent {
     WindowGroupsChanged,
     /// A window entered or left full screen, itself or as a member of a full-screen window group.
     WindowFullscreenChanged,
+    /// This remote window's connection to its host ended on its own (network loss, the host or
+    /// its server went away); the window's project is unreachable until it reconnects.
+    RemoteConnectionLost {
+        host: String,
+    },
     ProjectTrustChanged {
         root: crate::IpcPath,
         trusted: bool,
+    },
+    /// The project's direnv environment (`.envrc`) could not be loaded, or a file it is read
+    /// from changed and it can be reloaded.
+    Direnv {
+        root: crate::IpcPath,
+        status: DirenvStatus,
+    },
+    /// The project's `flutter daemon` changed state, or a device came or went.
+    FlutterDevices {
+        list: FlutterDeviceList,
     },
     /// Files or directories changed on disk (after debouncing, ignore rules applied).
     FsChanged {
@@ -118,6 +133,10 @@ pub enum IdeEvent {
     LanguageServer {
         server: ServerId,
         name: String,
+        /// What the user sees as the server when another program serves in its place.
+        #[serde(default)]
+        #[specta(optional)]
+        label: Option<String>,
         status: ServerStatus,
         message: Option<String>,
     },
@@ -137,6 +156,19 @@ pub enum IdeEvent {
     LspRefresh {
         server: ServerId,
         kind: LspRefreshKind,
+    },
+    /// A language server asked the user to choose an action, e.g. Dart's
+    /// "Renamed field will be invisible in …" warning during a rename. Answered
+    /// with `lsp_message_request_answer`; the server cancels if we reply null.
+    LspMessageRequest {
+        id: u32,
+        server: String,
+        message: String,
+        actions: Vec<String>,
+    },
+    /// The request was answered or timed out; every window drops its dialog.
+    LspMessageRequestDone {
+        id: u32,
     },
     TerminalExited {
         terminal: TerminalId,
@@ -204,6 +236,60 @@ pub enum AskpassKind {
     Text,
     /// Yes / no (an unknown host key); answered with `yes` or `no`.
     Confirm,
+}
+
+/// A target `flutter run -d <id>` can name, or an Android device adb sees but Flutter can't use yet.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FlutterDevice {
+    pub id: String,
+    pub name: String,
+    /// `android`, `ios`, `macos`, `web`, …
+    pub platform_type: Option<String>,
+    /// `mobile`, `desktop` or `web`.
+    pub category: Option<String>,
+    pub emulator: bool,
+    /// The adb state keeping it from being used (`unauthorized`, `offline`, …).
+    pub unavailable: Option<String>,
+}
+
+/// See [`FlutterDeviceList`].
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum FlutterDaemonStatus {
+    #[default]
+    Stopped,
+    /// Started; the first device discovery has not finished.
+    Starting,
+    Ready,
+    /// No `flutter` executable on the search path.
+    NotInstalled,
+    /// The daemon could not start or exited: what it printed last. It is not restarted on its own.
+    Failed {
+        message: String,
+    },
+}
+
+/// The project's Flutter devices, best default first.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct FlutterDeviceList {
+    pub status: FlutterDaemonStatus,
+    pub devices: Vec<FlutterDevice>,
+}
+
+/// See [`IdeEvent::Direnv`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(tag = "kind", rename_all = "camelCase", rename_all_fields = "camelCase")]
+pub enum DirenvStatus {
+    /// `direnv` is not installed (on the search path).
+    NotInstalled,
+    /// direnv refuses the `.envrc` until the user approves it with `direnv allow`.
+    Blocked,
+    /// `direnv export` failed or took too long: what it printed last.
+    Failed { message: String },
+    /// `.envrc`, `flake.nix` or `flake.lock` (a file name in the project root) changed.
+    Changed { file: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
@@ -281,6 +367,9 @@ pub enum DebugEvent {
         change_type: String,
         message: String,
     },
+    /// `flutter debug_adapter`'s `flutter.appStarted` event (launch and attach): the session is
+    /// a Flutter app that can take a hot reload now. The plain Dart adapter never sends it.
+    FlutterAppStarted,
     /// The session's capabilities changed after it started: fetch them again.
     Capabilities,
     /// The adapter's `invalidated` event: what it shows for `areas` (`all`, `stacks`, `threads`,
@@ -291,6 +380,56 @@ pub enum DebugEvent {
     JvmBackend {
         state: JvmBackendState,
     },
+    /// A step in the life of one request of a debugged page.
+    JsNetwork {
+        event: JsNetworkEvent,
+    },
+    /// The adapter does not report the requests of this page: there will be no `JsNetwork`.
+    JsNetworkUnavailable,
+}
+
+/// Which step of a request a [`JsNetworkEvent`] reports.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum JsNetworkKind {
+    Request,
+    Response,
+    Finished,
+    Failed,
+}
+
+/// The script frame that made a request, where the browser ran it (0-based line and column).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JsInitiator {
+    pub function: String,
+    pub url: String,
+    pub line: u32,
+    pub column: u32,
+}
+
+/// What a debugged page's browser reports about a request, reduced to what the Network view
+/// shows. Events of one request share `request_id`; each kind fills its own fields.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct JsNetworkEvent {
+    pub kind: JsNetworkKind,
+    pub request_id: String,
+    /// The browser's monotonic clock, comparable between the events of a page.
+    pub timestamp_ms: u64,
+    /// Request and response.
+    pub url: Option<String>,
+    pub method: Option<String>,
+    /// `Fetch`, `XHR`, `Script`, `Document`, …
+    pub resource_type: Option<String>,
+    pub status: Option<u16>,
+    pub mime_type: Option<String>,
+    /// The request's headers, or the response's.
+    pub headers: BTreeMap<String, String>,
+    /// Bytes received over the network, once finished.
+    pub encoded_length: Option<u64>,
+    pub error_text: Option<String>,
+    pub initiator: Option<JsInitiator>,
 }
 
 /// The backend that reads a debugged JVM's objects (instances, fields, referrers).

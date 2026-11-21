@@ -6,8 +6,9 @@
  */
 import { registerActions, type Action } from "@/platform/actions";
 import { call, commands, type FileProbe } from "@/platform/ipc";
-import { getContext } from "@/platform/context";
+import { activeEditor } from "@/editor/api";
 import { openWithSystemApp } from "@/platform/fileManager";
+import { onFileTypesChange } from "@/platform/fileTypes";
 import { basename, useProject } from "@/platform/project";
 import { fileIconName, lazyComponent } from "@/ui";
 import {
@@ -71,8 +72,10 @@ function markdownActions(): Action[] {
     keywords: ["markdown", "preview", "layout"],
     when: "textEditorActive && editorLangId == markdown",
     run: ({ arg }) => {
-      const path = typeof arg === "string" ? arg : getContext().editorPath;
-      if (typeof path === "string" && isMarkdownPath(path)) setMarkdownMode(path, m);
+      // The tab's layout buttons pass their tab; the keyboard acts on the focused editor's.
+      const editor = activeEditor();
+      const tabId = typeof arg === "string" ? arg : isMarkdownPath(editor?.ctx.path ?? "") ? editor?.tabId : undefined;
+      if (tabId) setMarkdownMode(tabId, m);
     },
   });
   return [
@@ -85,15 +88,16 @@ function markdownActions(): Action[] {
 export function activate(): () => void {
   const probes = new Map<string, Promise<FileProbe>>();
   const disposers = [
+    // Open tabs gain or lose the Markdown preview when File Types change.
+    onFileTypesChange(() => useTextEditorWrappers.setState((w) => ({ wrappers: new Map(w.wrappers) }))),
     // Files associated with another application (Settings › Editor › File Types)
     // win over the viewers below; a failed launch falls through to them.
     registerExternalFileOpenHandler({
       id: "viewers.associatedApps",
       order: 1,
-      open: (path) => {
-        const patterns = useProject.getState().settings?.files?.associatedApplications ?? [];
-        return associatedApplication(path, patterns) ? openWithSystemApp(path) : false;
-      },
+      matches: (path) =>
+        associatedApplication(path, useProject.getState().settings?.files?.associatedApplications ?? []),
+      open: openWithSystemApp,
     }),
     registerEditorKind({ kind: IMAGE_KIND, component: ImageViewer, title: titleOf, icon: iconOf }),
     registerEditorKind({ kind: BINARY_KIND, component: HexViewer, title: titleOf, icon: iconOf }),

@@ -14,6 +14,8 @@ import { canDrop, canModifyTable, canRename, reference, scriptSql, type ScriptKi
 import {
   DB_TOOL_WINDOW,
   OUTPUT_TAB,
+  connect,
+  createsDatabases,
   RESULTS_VIEW,
   detailsKey,
   disconnect,
@@ -22,7 +24,11 @@ import {
   loadSchemas,
   loadSources,
   loadTables,
+  consoleFiles,
+  newSchemaTarget,
+  newConsole,
   openConsole,
+  openConsoleFile,
   openConsoleWith,
   openDdl,
   openObjectDdl,
@@ -41,7 +47,9 @@ import {
   removeSource,
 } from "./store";
 import { tableInput } from "./tableInput";
+import { dumpScope, mysqlDumpScope } from "./dumpTools";
 import { tx } from "@/platform/i18n";
+import { chooseItem } from "@/workbench/inputDialogs";
 import { databaseRequest } from "./requests";
 
 /** Context key: the Database tree has focus. */
@@ -94,6 +102,19 @@ async function tablesIn(id: string, schema: string): Promise<DbTableInfo[]> {
   if (useDatabase.getState().tables[tablesKey(id, schema)]?.status !== "ok") await loadTables(id, schema);
   const l = useDatabase.getState().tables[tablesKey(id, schema)];
   return l?.status === "ok" ? l.value : [];
+}
+
+/**
+ * Connects to `target` before a dump / restore dialog opens (a password prompt would replace
+ * the dialog) and reads the server's version; `undefined` when the user cancelled.
+ */
+async function serverVersionOf(target: string): Promise<number | null | undefined> {
+  if (!(await connect(target))) return undefined;
+  try {
+    return await withConnection(target, () => call(commands.dbServerVersion(target)));
+  } catch {
+    return null;
+  }
 }
 
 /** DDL of a table / view, or of every table and view of a schema or data source. */
@@ -279,7 +300,7 @@ export function registerDatabaseTreeActions(): () => void {
         const id = n ? nodeTarget(n) : null;
         const { sources } = useDatabase.getState();
         const target = id ?? (sources.length === 1 ? (sources[0]!.id ?? null) : null);
-        if (target) void openConsole(target);
+        if (target) void jumpToConsole(target);
         else toolWindowService().show(DB_TOOL_WINDOW, true);
       },
     }),
@@ -339,6 +360,9 @@ export function registerDatabaseTreeActions(): () => void {
         if (!n) return;
         const id = nodeTarget(n);
         if (n.kind === "source") return void removeSource(n.source);
+        const source = sourceById(id);
+        if (n.kind === "database" && !n.current && !source?.readOnly && createsDatabases(source))
+          return openDialog({ kind: "dropDatabase", id: splitTarget(n.id).id, database: n.name });
         const o = objectOf(n);
         if (id && o && canDrop(driverOf(id), o)) openDialog({ kind: "drop", id, object: o });
       },
@@ -349,7 +373,7 @@ export function registerDatabaseTreeActions(): () => void {
       keywords: ["delete all rows", "empty table"],
       run: ({ arg }) => {
         const n = nodeFrom(arg);
-        if (n?.kind === "table" && n.table.kind === "table")
+        if (n?.kind === "table" && n.table.kind === "table" && driverOf(n.id) !== "jdbc")
           openDialog({ kind: "truncate", id: n.id, schema: n.schema, table: n.table.name });
       },
     }),
@@ -372,6 +396,28 @@ export function registerDatabaseTreeActions(): () => void {
       },
     }),
     tree({
+      id: "db.newDatabase",
+      title: "Database…",
+      icon: "db-database",
+      keywords: ["create database", "new database"],
+      run: ({ arg }) => {
+        const source = sourceOf(nodeFrom(arg));
+        if (source?.id && !source.readOnly && createsDatabases(source))
+          openDialog({ kind: "createDatabase", id: source.id });
+      },
+    }),
+    tree({
+      id: "db.newSchema",
+      title: "Schema…",
+      icon: "db-schema",
+      keywords: ["create schema", "new schema"],
+      run: ({ arg }) => {
+        const n = nodeFrom(arg);
+        const id = n && newSchemaTarget(n);
+        if (id && !sourceById(id)?.readOnly) openDialog({ kind: "createSchema", id });
+      },
+    }),
+    tree({
       id: "db.newTable",
       title: "Table",
       icon: "db-table",
@@ -379,10 +425,27 @@ export function registerDatabaseTreeActions(): () => void {
       run: ({ arg }) => {
         const n = nodeFrom(arg);
         const id = n && nodeTarget(n);
-        if (!n || !id) return;
+        if (!n || !id || driverOf(id) === "jdbc") return;
         const schema =
           "schema" in n && typeof n.schema === "string" ? n.schema : driverOf(id) === "sqlite" ? "main" : null;
         if (schema !== null) openDialog({ kind: "modifyTable", id, schema, table: null });
+      },
+    }),
+    tree({
+      id: "db.compareSchemas",
+      title: "Compare Structure…",
+      description: "Compare the tables of two schemas and write the migration SQL from one to the other",
+      icon: "diff-side-by-side",
+      keywords: ["schema compare", "diff", "migration", "compare schemas", "structure"],
+      run: ({ arg }) => {
+        const n = nodeFrom(arg);
+        const id = n && nodeTarget(n);
+        const schema = n && "schema" in n && typeof n.schema === "string" ? n.schema : null;
+        if (id && driverOf(id) === "jdbc") return;
+        openDialog({
+          kind: "compareSchemas",
+          source: id ? { id, schema: schema ?? (driverOf(id) === "sqlite" ? "main" : "") } : null,
+        });
       },
     }),
     tree({
@@ -404,8 +467,61 @@ export function registerDatabaseTreeActions(): () => void {
       keywords: ["csv", "tsv", "load data"],
       run: ({ arg }) => {
         const n = nodeFrom(arg);
-        if (n?.kind === "table" && n.table.kind === "table" && driverOf(n.id) !== "clickhouse")
+        if (
+          n?.kind === "table" &&
+          n.table.kind === "table" &&
+          driverOf(n.id) !== "clickhouse" &&
+          driverOf(n.id) !== "jdbc"
+        )
           openDialog({ kind: "import", id: n.id, schema: n.schema, table: n.table.name });
+      },
+    }),
+    tree({
+      id: "db.dumpWithPgDump",
+      title: "Export with 'pg_dump'…",
+      icon: "export",
+      keywords: ["backup", "dump", "postgresql"],
+      run: async ({ arg }) => {
+        const n = nodeFrom(arg);
+        const scope = n && dumpScope(n, sourceOf(n));
+        const serverVersion = scope && (await serverVersionOf(scope.target));
+        if (scope && serverVersion !== undefined) openDialog({ kind: "dump", ...scope, serverVersion });
+      },
+    }),
+    tree({
+      id: "db.restoreWithPgRestore",
+      title: "Restore with 'pg_restore'/'psql'…",
+      icon: "download",
+      keywords: ["backup", "restore", "load dump", "postgresql"],
+      run: async ({ arg }) => {
+        const n = nodeFrom(arg);
+        const scope = n && dumpScope(n, sourceOf(n));
+        const serverVersion = scope && (await serverVersionOf(scope.target));
+        if (scope && serverVersion !== undefined)
+          openDialog({ kind: "restore", target: scope.target, database: scope.database, serverVersion });
+      },
+    }),
+    tree({
+      id: "db.dumpWithMysqldump",
+      title: "Export with 'mysqldump'…",
+      icon: "export",
+      keywords: ["backup", "dump", "mysql", "mariadb"],
+      run: async ({ arg }) => {
+        const n = nodeFrom(arg);
+        const scope = n && mysqlDumpScope(n, sourceOf(n));
+        if (scope && (await connect(scope.target))) openDialog({ kind: "mysqlDump", ...scope });
+      },
+    }),
+    tree({
+      id: "db.restoreWithMysql",
+      title: "Restore with 'mysql'…",
+      icon: "download",
+      keywords: ["backup", "restore", "load dump", "mysql", "mariadb"],
+      run: async ({ arg }) => {
+        const n = nodeFrom(arg);
+        const scope = n && mysqlDumpScope(n, sourceOf(n));
+        if (scope && (await connect(scope.target)))
+          openDialog({ kind: "mysqlRestore", target: scope.target, database: scope.database });
       },
     }),
     tree({
@@ -523,4 +639,15 @@ export function registerDatabaseTreeActions(): () => void {
       run: () => useDatabase.setState({ treeExpanded: new Set() }),
     }),
   ]);
+}
+
+/** One console opens directly; with several, DataGrip's list of them plus New Query Console. */
+async function jumpToConsole(id: string): Promise<void> {
+  const files = await consoleFiles(id).catch(() => []);
+  if (files.length <= 1) return openConsole(id);
+  const names = files.map((f) => (f.split(/[\\/]/).pop() ?? f).replace(/\.sql$/, ""));
+  const create = tx("New Query Console");
+  const picked = await chooseItem({ title: "Query Consoles", items: [...names, create] });
+  if (picked === create) await newConsole(id);
+  else if (picked) await openConsoleFile(id, files[names.indexOf(picked)]!);
 }

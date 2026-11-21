@@ -2,7 +2,8 @@
  * Java debugging through Microsoft java-debug, a jdtls bundle: jdtls starts its
  * DAP server (`vscode.java.startDebugSession`) and the session connects to that
  * port (`debugServer`). Application configurations are launched by java-debug;
- * JVMs started by Maven / Gradle with a JDWP agent are attached to.
+ * JVMs started by Maven / Gradle with a JDWP agent are attached to. Modules that
+ * jdtls doesn't serve debug with java-analyzer's own adapter (`java-analyzer dap`).
  */
 import { executeAction } from "@/platform/actions";
 import { call, commands, IpcError, nextRequestId, type LaunchConfig, type RunConfig } from "@/platform/ipc";
@@ -13,6 +14,7 @@ import {
   joinJavaArgs,
   parseJavaArgs,
   prepareJavaLaunch,
+  remoteJavaAgentNote,
   type JavaPreparation,
 } from "@/platform/javaLaunch";
 import { maybeEditorService, notifications } from "@/workbench/contributions";
@@ -20,6 +22,7 @@ import { withEnvFiles } from "./launch";
 
 export const JAVA_ADAPTER = "java-debug";
 export const KOTLIN_ADAPTER = "kotlin-debug-adapter";
+export const JAVA_ANALYZER_ADAPTER = "java-analyzer";
 const KOTLIN_LSP = "kotlin-lsp";
 
 export function isJavaDebuggable(rc: RunConfig): boolean {
@@ -168,6 +171,8 @@ export async function javaLaunchConfig(
   // java-debug starts the JVM itself, bypassing the Run process that echoes its
   // command line. Echo the equivalent launch here so Debug and Run stay comparable.
   preparation?.report?.(`${joinJavaArgs([resolved.command, ...resolved.args])}\n`);
+  const agentNote = await remoteJavaAgentNote(rc);
+  if (agentNote) preparation?.report?.(agentNote);
   if (kotlin) {
     return {
       name: rc.name,
@@ -185,6 +190,27 @@ export async function javaLaunchConfig(
         javaExec: resolved.command,
         vmArguments: [...consoleVmArgs(rc), ...parsed.vmArgs],
         programArgs: parsed.programArgs,
+      }),
+    };
+  }
+  if ((await call(commands.javaDebugAdapter(module))) === JAVA_ANALYZER_ADAPTER) {
+    preparation?.signal.throwIfAborted();
+    return {
+      name: rc.name,
+      adapter: JAVA_ANALYZER_ADAPTER,
+      request: "launch",
+      program: null,
+      args: [],
+      cwd,
+      env: { ...rc.env },
+      extraJson: JSON.stringify({
+        projectRoot: join(root, module),
+        mainClass: parsed.mainClass,
+        classPaths,
+        modulePaths: info.modulePaths,
+        javaExec: resolved.command === "java" ? undefined : resolved.command,
+        vmArgs: [...consoleVmArgs(rc), ...parsed.vmArgs],
+        args: parsed.programArgs,
       }),
     };
   }
@@ -241,6 +267,18 @@ export async function javaAttachConfig(target: JavaAttachTarget, root: string): 
     return {
       name: target.name,
       adapter: KOTLIN_ADAPTER,
+      request: "attach",
+      program: null,
+      args: [],
+      cwd,
+      env: {},
+      extraJson: JSON.stringify({ projectRoot: cwd, hostName: target.hostName, port: target.port, timeout: 30_000 }),
+    };
+  }
+  if ((await call(commands.javaDebugAdapter(target.module))) === JAVA_ANALYZER_ADAPTER) {
+    return {
+      name: target.name,
+      adapter: JAVA_ANALYZER_ADAPTER,
       request: "attach",
       program: null,
       args: [],
