@@ -1,0 +1,108 @@
+name: Kylin sync
+
+# Keeps the `kylin` branch on the newest upstream release tag and asks
+# `Kylin build` to package and publish it.
+#
+# A tag pushed with GITHUB_TOKEN does not start the tag-triggered workflow:
+# GitHub suppresses events caused by GITHUB_TOKEN. `workflow_dispatch` is the
+# documented exception, so the last step dispatches the build explicitly
+# instead of relying on the tag push.
+#
+# Scheduled workflows run from the default branch, which is why this file also
+# lives on `main`; it checks out `kylin` itself.
+#
+# GitHub disables schedules in a repository after 60 days without activity, so
+# a quiet fork needs this workflow re-enabled from the Actions tab.
+
+on:
+  schedule:
+    - cron: "0 3 * * *" # 11:00 Asia/Shanghai
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Upstream tag to sync (empty = newest stable tag)"
+        required: false
+        type: string
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: kylin-sync
+  cancel-in-progress: false
+
+env:
+  UPSTREAM: https://github.com/l0ng-ai/openidea.git
+
+jobs:
+  sync:
+    name: Sync upstream tag
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: kylin
+          fetch-depth: 0
+
+      - name: Pick the newest stable tag
+        id: pick
+        run: |
+          set -euo pipefail
+          git remote add upstream "$UPSTREAM"
+          git fetch --tags --quiet upstream
+          tag='${{ inputs.tag }}'
+          if [ -z "$tag" ]; then
+            # Nightlies (v0.1.41-nightly.…) are skipped on purpose: they are
+            # rebuilt every day and would keep this job busy for nothing.
+            tag=$(git tag --list 'v*' \
+              | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' \
+              | sort -V | tail -1)
+          fi
+          test -n "$tag" || { echo "::error::no upstream tag found"; exit 1; }
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "picked $tag"
+
+      - name: Merge it into kylin
+        run: |
+          set -euo pipefail
+          tag='${{ steps.pick.outputs.tag }}'
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          if git merge-base --is-ancestor "$tag" HEAD; then
+            echo "kylin already contains $tag"
+          else
+            git merge --no-edit "$tag"
+          fi
+
+      - name: Check whether this version is already published
+        id: version
+        run: |
+          set -euo pipefail
+          version=$(jq -r .version src-tauri/tauri.conf.json)
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          if git ls-remote --exit-code --tags origin "refs/tags/kylin-v$version" >/dev/null 2>&1; then
+            echo "kylin-v$version already exists, nothing to do"
+            echo "new=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "new=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Push the branch and the tag
+        if: steps.version.outputs.new == 'true'
+        run: |
+          set -euo pipefail
+          version='${{ steps.version.outputs.version }}'
+          git push origin kylin
+          git tag "kylin-v$version"
+          git push origin "kylin-v$version"
+
+      - name: Build and publish
+        if: steps.version.outputs.new == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          version='${{ steps.version.outputs.version }}'
+          gh workflow run kylin.yml --ref "kylin-v$version" -f release=true
+          echo "dispatched kylin.yml for kylin-v$version"
