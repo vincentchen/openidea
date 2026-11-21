@@ -15,8 +15,11 @@ name: Kylin build
 #
 # Triggers:
 #   - manual run (Actions -> Kylin build -> Run workflow)
-#   - push to the `kylin` branch
-#   - push of a `kylin-v*` tag (also publishes a release)
+#   - push of a `kylin-v*` tag (also publishes a release); `Kylin sync` creates
+#     those tags from the newest upstream release, so the daily build starts here
+#
+# A plain push to `kylin` does not build: `Kylin sync` pushes the branch and the
+# tag together, and only the tag should cost a build.
 
 on:
   workflow_dispatch:
@@ -31,7 +34,6 @@ on:
         type: boolean
         default: false
   push:
-    branches: [kylin]
     tags: ["kylin-v*"]
 
 permissions:
