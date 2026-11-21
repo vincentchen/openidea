@@ -15,6 +15,9 @@ impl ReplaceHost for DocumentsHost<'_> {
             Some(doc) => (doc, false),
             None => (docs.open(path)?.id, true),
         };
+        // A buffer without unsaved changes (open only for the search preview, or a clean
+        // tab) is saved like a closed file; one the user is editing is left unsaved.
+        let save = transient || !docs.is_dirty(doc)?;
         let result = (|| {
             // Recompute if the user typed between reading the text and applying.
             for _ in 0..3 {
@@ -27,7 +30,7 @@ impl ReplaceHost for DocumentsHost<'_> {
                     continue;
                 }
                 docs.apply_edits(doc, &edits)?;
-                if transient {
+                if save {
                     docs.save(doc)?;
                 }
                 return Ok(edits.len() as u32);
@@ -46,8 +49,8 @@ impl ReplaceHost for DocumentsHost<'_> {
 ///
 /// Edits go through the document layer as one patch per file, so open editors
 /// update live and undo the whole file's replacements in one step. Unsaved
-/// editor buffers are replaced in place and left unsaved; files that were not
-/// open are opened transiently, saved and closed.
+/// editor buffers are replaced in place and left unsaved; other open documents
+/// are saved, and files that were not open are opened transiently, saved and closed.
 ///
 /// With `all_in_scope` (Replace All after the search hit its match limit) the
 /// scope is searched again without the limit and every match in it is replaced,
@@ -72,9 +75,19 @@ pub async fn replace_in_files(
     let summary = tokio::task::spawn_blocking(move || {
         let targets = if all_in_scope { scope_targets(&project, &syntax, &query, targets, &cancel)? } else { targets };
         let host = DocumentsHost(&project.documents);
-        ide_search::replace_files(&host, &query, &replacement, preserve_case, &targets, &cancel, &|e| {
-            let _ = events.send(e);
-        })
+        let literals = |path: &Path, text: &str| super::literals_of(&project, &syntax, path, text);
+        ide_search::replace_files_in_context(
+            &host,
+            &query,
+            &replacement,
+            preserve_case,
+            &targets,
+            Some(&literals),
+            &cancel,
+            &|e| {
+                let _ = events.send(e);
+            },
+        )
     })
     .await
     .map_err(|e| ide_core::IdeError::internal(e.to_string()));

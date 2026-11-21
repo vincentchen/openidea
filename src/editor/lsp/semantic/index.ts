@@ -30,6 +30,7 @@ import "./kotlin";
 import "./python";
 import "./php";
 import "./go";
+import "./java";
 
 const semanticBackoff = featureBackoff();
 
@@ -45,6 +46,8 @@ const TYPE_CLASS: Record<string, string> = {
   typeParameter: "typeParameter",
   function: "function",
   method: "function",
+  // typescript-language-server passes tsserver's name for methods through (vtsls renames it `method`).
+  member: "function",
   macro: "macro",
   decorator: "annotation",
   // jdtls extensions

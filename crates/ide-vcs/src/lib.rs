@@ -125,6 +125,9 @@ pub struct Commit {
     pub log_position: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub log_total: Option<u32>,
+    /// Newest committer time at or after this row if newer than the row's commit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub log_merge_time_ms: Option<f64>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub graph_boundary_parents: Vec<String>,
     /// Reachability from HEAD, computed independently of the visible filters.
@@ -257,6 +260,27 @@ pub struct Branch {
     /// Tip commit id.
     #[serde(default)]
     pub commit: String,
+}
+
+/// What Update Selected did to one local branch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub enum BranchUpdateStatus {
+    Updated,
+    UpToDate,
+    /// Diverged from its upstream: left as it is.
+    NotFastForward,
+    NoUpstream,
+    Failed,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, Type)]
+#[serde(rename_all = "camelCase")]
+pub struct BranchUpdate {
+    pub branch: String,
+    pub status: BranchUpdateStatus,
+    /// Why it failed.
+    pub message: Option<String>,
 }
 
 /// Commit Options (IDEA's commit options popup).
@@ -768,6 +792,8 @@ pub struct Repo {
     git_dir: PathBuf,
     inner: std::sync::Mutex<repo::Cache>,
     ignored: std::sync::RwLock<IgnoredNames>,
+    /// Working-tree status from `git status` instead of gitoxide.
+    cli_status: std::sync::atomic::AtomicBool,
     log_index: std::sync::Mutex<log_index::LogIndex>,
     log_signatures: std::sync::Mutex<std::collections::HashMap<String, LogDetails>>,
 }
@@ -793,6 +819,11 @@ impl Repo {
     pub fn set_ignored_names(&self, names: IgnoredNames) {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         *self.ignored.write().unwrap_or_else(|p| p.into_inner()) = names;
+    }
+    /// Read the working-tree status with `git status` rather than in process: for file systems
+    /// (encryption or protection layers) whose metadata only the system git reads correctly.
+    pub fn set_cli_status(&self, on: bool) {
+        self.cli_status.store(on, std::sync::atomic::Ordering::Release);
     }
     /// Staged (HEAD↔index) and unstaged (index↔worktree, incl. untracked) changes,
     /// sorted by path. Conflicted files report `unstaged: Conflicted` and no staged kind.
@@ -1164,6 +1195,20 @@ impl Repo {
         Ok((out.code == Some(0)).then(|| out.stdout_str().trim().to_string()))
     }
 
+    /// Sets `user.name` and `user.email` for commits: in this repository's config, or in the
+    /// user's global one (`global`).
+    pub fn set_user_identity(&self, name: &str, email: &str, global: bool) -> IdeResult<()> {
+        let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
+        let scope = if global { "--global" } else { "--local" };
+        for (key, value) in [("user.name", name.trim()), ("user.email", email.trim())] {
+            if value.is_empty() {
+                return Err(IdeError::invalid(format!("{key} must not be empty")));
+            }
+            cli::run(&self.root, &["config", scope, key, value], None)?;
+        }
+        Ok(())
+    }
+
     // ---- writes (git CLI) ----
     pub fn stage(&self, paths: &[PathBuf]) -> IdeResult<()> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
@@ -1437,11 +1482,16 @@ impl Repo {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
         write::reset_to_upstream(self, cancel, on_output)
     }
-    /// Fast-forwards a local branch that is not checked out to its upstream (Branches ›
-    /// Update). Fails when the branch has diverged.
-    pub fn update_branch(&self, branch: &str, cancel: &CancellationToken, on_output: &dyn Fn(String)) -> IdeResult<()> {
+    /// Branches › Update Selected: fetches each remote once and fast-forwards every
+    /// branch to its upstream, reporting the branches it could not update.
+    pub fn update_branches(
+        &self,
+        branches: &[String],
+        cancel: &CancellationToken,
+        on_output: &dyn Fn(String),
+    ) -> IdeResult<Vec<BranchUpdate>> {
         let _scope = crate::ExecutionScope::enter(self.execution_allowed.load(std::sync::atomic::Ordering::Acquire));
-        write::update_branch(self, branch, cancel, on_output)
+        write::update_branches(self, branches, cancel, on_output)
     }
     // ---- in-progress operations, history rewriting, tags ----
 

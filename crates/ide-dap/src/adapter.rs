@@ -22,6 +22,8 @@ use tokio::process::{Child, Command};
 pub const PORT_PLACEHOLDER: &str = "${port}";
 /// Replaced by the session's working directory (the project) in adapter arguments.
 pub const ROOT_PLACEHOLDER: &str = "${root}";
+/// java-analyzer's debug adapter (`java-analyzer dap`), a separate process over stdio.
+pub const JAVA_ANALYZER: &str = "java-analyzer";
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Transport {
@@ -47,6 +49,8 @@ pub struct AdapterSpec {
     pub connect: Option<String>,
     /// A plugin language's adapter: start exactly this approved program.
     pub pinned: Option<ProgramPin>,
+    /// See [`DebuggerConfig::resolve_lazy_variables`].
+    pub resolve_lazy_variables: bool,
 }
 
 /// Built-in adapters used when no language definition names `adapter`.
@@ -58,6 +62,7 @@ fn builtin(adapter: &str) -> Option<DebuggerConfig> {
         transport: transport.to_owned(),
         connect: None,
         install_hint: Some(hint.to_owned()),
+        resolve_lazy_variables: false,
         pinned: None,
     };
     Some(match adapter {
@@ -128,11 +133,22 @@ fn builtin(adapter: &str) -> Option<DebuggerConfig> {
         ),
         "rdbg" => cfg("rdbg", &["-O", "--port", PORT_PLACEHOLDER, "-c"], "tcp", "gem install debug"),
         // A jdtls bundle: the session is started through jdtls and reached via `debugServer`.
-        "java-debug" => cfg(
-            "com.microsoft.java.debug.plugin.jar",
-            &[],
-            "tcp",
-            "Install Microsoft java-debug (Settings › Languages & Frameworks › Language Servers)",
+        "java-debug" => DebuggerConfig {
+            resolve_lazy_variables: true,
+            ..cfg(
+                "com.microsoft.java.debug.plugin.jar",
+                &[],
+                "tcp",
+                "Install Microsoft java-debug (Settings › Languages & Frameworks › Language Servers)",
+            )
+        },
+        // The Java language server's own debugger, for modules jdtls doesn't serve; the host
+        // runs the executable of the java-analyzer serving the module.
+        JAVA_ANALYZER => cfg(
+            "java-analyzer",
+            &["dap"],
+            "stdio",
+            "Configure java-analyzer as a Java language server (Settings › Languages & Frameworks › Language Servers)",
         ),
         "bun-dap" => cfg(
             "bun-dap",
@@ -176,6 +192,7 @@ pub fn resolve(config: &DebuggerConfig, cwd: PathBuf) -> AdapterSpec {
         server_host: None,
         connect: config.connect.clone(),
         pinned: config.pinned.clone(),
+        resolve_lazy_variables: config.resolve_lazy_variables,
     }
 }
 
@@ -920,6 +937,13 @@ mod tests {
         }
         let delve = resolve(&builtin("delve").unwrap(), PathBuf::from("/"));
         assert_eq!(delve.transport, Transport::Tcp);
+        // java-analyzer debugs over stdio with its `dap` subcommand.
+        let java_analyzer = resolve(&builtin(JAVA_ANALYZER).unwrap(), PathBuf::from("/"));
+        assert_eq!(
+            (java_analyzer.command.as_str(), java_analyzer.args.as_slice()),
+            ("java-analyzer", &["dap".to_owned()][..])
+        );
+        assert_eq!(java_analyzer.transport, Transport::Stdio);
         // GDB's own DAP interpreter over stdio, with the required version in its hint.
         let gdb = builtin("gdb").unwrap();
         assert_eq!(gdb.command, "gdb");

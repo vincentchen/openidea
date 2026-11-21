@@ -99,6 +99,9 @@ pub(crate) struct Session {
     pub js_overrides: tokio::sync::Mutex<Option<tokio::sync::watch::Sender<Vec<crate::JsResponseRule>>>>,
     /// The file js-debug records the page's CPU profile into, while one is being recorded.
     pub js_profile: parking_lot::Mutex<Option<std::path::PathBuf>>,
+    /// The device of the app `flutter debug_adapter` announced, once it did: the Dart adapter
+    /// sends the same `dart.*` events.
+    pub flutter_app: std::sync::OnceLock<Option<String>>,
     pub jvm_inspector: parking_lot::Mutex<Option<Arc<dyn ide_jvm_inspect::JvmInspector>>>,
     /// One inspector request per session at a time.
     pub inspect_lock: tokio::sync::Mutex<()>,
@@ -115,6 +118,11 @@ pub(crate) struct Session {
     pub kotlin_mirror: Mutex<Option<crate::kotlin::SourceMirror>>,
     pub jvm_memory: tokio::sync::Mutex<crate::JvmMemoryState>,
     pub stream_tracer: parking_lot::Mutex<Option<Arc<dyn ide_jvm_inspect::StreamTracer>>>,
+    /// Given at start: the class breakpoints must be armed before `configurationDone`.
+    pub(crate) exception_classes: Option<Arc<dyn ide_jvm_inspect::ExceptionClassBreakpoints>>,
+    /// Held from `setExceptionBreakpoints`, which drops the class breakpoints, until they are
+    /// armed again, so that the last list armed is the manager's.
+    pub(crate) exception_turn: tokio::sync::Mutex<()>,
     pub(crate) stream_trace: parking_lot::Mutex<Option<crate::stream_trace::ActiveTrace>>,
     /// The last trace that finished, until the stop its records were read in ends.
     pub(crate) stream_trace_done: parking_lot::Mutex<Option<crate::stream_trace::DoneTrace>>,
@@ -274,6 +282,7 @@ impl Session {
             launch_type: std::sync::OnceLock::new(),
             js_overrides: tokio::sync::Mutex::new(None),
             js_profile: parking_lot::Mutex::new(None),
+            flutter_app: std::sync::OnceLock::new(),
             jvm_inspector: parking_lot::Mutex::new(None),
             inspect_lock: tokio::sync::Mutex::default(),
             ended: ide_core::CancellationToken::new(),
@@ -282,6 +291,8 @@ impl Session {
             kotlin_mirror: Mutex::new(None),
             jvm_memory: tokio::sync::Mutex::default(),
             stream_tracer: parking_lot::Mutex::new(None),
+            exception_classes: None,
+            exception_turn: tokio::sync::Mutex::default(),
             stream_trace: parking_lot::Mutex::new(None),
             stream_trace_done: parking_lot::Mutex::new(None),
             quirks: kotlin_lsp::Quirks::default(),
@@ -504,6 +515,9 @@ impl Session {
 
 /// How long Stop waits for a launched program to exit before reporting the session ended.
 pub(crate) const DEBUGGEE_EXIT_WAIT: Duration = Duration::from_secs(10);
+/// How long a stop waits for a killed program to be gone (Windows ends processes asynchronously).
+#[cfg(windows)]
+const DEBUGGEE_KILL_WAIT: Duration = Duration::from_secs(5);
 
 pub(crate) async fn remember_debuggee(s: &Arc<Session>) {
     #[cfg(windows)]
@@ -643,14 +657,24 @@ pub(crate) async fn wait_for_debuggee(s: &Arc<Session>, terminate: bool) {
     }
     #[cfg(windows)]
     {
+        use std::time::Instant;
         remember_debuggee(s).await;
-        let deadline = std::time::Instant::now() + DEBUGGEE_EXIT_WAIT;
+        let deadline = Instant::now() + DEBUGGEE_EXIT_WAIT;
+        let mut killed: Option<Instant> = None;
         // The captured tree is the oracle when it was captured; otherwise the job (every
         // process the launch started) is, so a failed capture can no longer end the wait
         // while the program still holds its port.
         while launch_running(s) {
-            if s.stop_force.swap(false, Ordering::AcqRel) || std::time::Instant::now() >= deadline {
+            let now = Instant::now();
+            if s.stop_force.swap(false, Ordering::AcqRel) || (killed.is_none() && now >= deadline) {
                 signal_debuggee(s, true).await;
+                killed.get_or_insert(now);
+            }
+            // Termination is asynchronous, and a process TerminateProcess can't end (stuck in
+            // the kernel) would hold the stop forever: give up on it, as on Unix.
+            if killed.is_some_and(|at| now.duration_since(at) >= DEBUGGEE_KILL_WAIT) {
+                tracing::warn!(session = s.id.0, pid, "stop: the debugged program did not exit after it was killed");
+                break;
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
@@ -866,6 +890,7 @@ async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut bo
             change_type: crate::hot_code_replace_type(body.get("changeType")),
             message: str_("message").unwrap_or_default(),
         }),
+        "flutter.appStarted" => s.emit(DebugEvent::FlutterAppStarted),
         // Sent only by adapters told `supportsInvalidatedEvent` (kotlin-lsp).
         "invalidated" => s.emit(DebugEvent::Invalidated {
             areas: body
@@ -884,6 +909,20 @@ async fn on_event(mgr: &Arc<DebugManager>, s: &Arc<Session>, event: &str, mut bo
         "profileStarted" => {
             *s.js_profile.lock() = str_("file").map(std::path::PathBuf::from);
         }
+        // Sent before `dart.debuggerUris`, for `launch` and `attach` alike.
+        "flutter.appStart" => {
+            let _ = s.flutter_app.set(str_("deviceId"));
+        }
+        "dart.debuggerUris" => {
+            if let (Some(device), Some(uri)) = (s.flutter_app.get(), str_("vmServiceUri")) {
+                s.emit(DebugEvent::FlutterVmService { uri, device: device.clone() });
+            }
+        }
+        "dart.toolEvent" if s.flutter_app.get().is_some() => {
+            if let Some(event) = crate::flutter_navigation(&body) {
+                s.emit(event);
+            }
+        }
         _ => tracing::trace!("dap: ignored event {event}"),
     }
 }
@@ -892,7 +931,11 @@ fn on_reverse_request(mgr: &Arc<DebugManager>, s: &Arc<Session>, seq: i64, comma
     match command {
         "runInTerminal" => {
             let result = run_in_terminal(s, &args);
-            let _ = s.conn.respond(seq, command, result);
+            let conn = s.conn.clone();
+            let command = command.to_owned();
+            tokio::spawn(async move {
+                let _ = conn.respond(seq, &command, result).await;
+            });
         }
         "startDebugging" => {
             let mgr = mgr.clone();
@@ -901,11 +944,15 @@ fn on_reverse_request(mgr: &Arc<DebugManager>, s: &Arc<Session>, seq: i64, comma
                 let request = args.get("request").and_then(Value::as_str).unwrap_or("launch").to_owned();
                 let configuration = args.get("configuration").cloned().unwrap_or_else(|| json!({}));
                 let result = mgr.start_child(&s, request, configuration).await;
-                let _ = s.conn.respond(seq, "startDebugging", result.map(|_| Value::Null).map_err(|e| e.message));
+                let _ = s.conn.respond(seq, "startDebugging", result.map(|_| Value::Null).map_err(|e| e.message)).await;
             });
         }
         _ => {
-            let _ = s.conn.respond(seq, command, Err(format!("unsupported reverse request {command}")));
+            let conn = s.conn.clone();
+            let command = command.to_owned();
+            tokio::spawn(async move {
+                let _ = conn.respond(seq, &command, Err(format!("unsupported reverse request {command}"))).await;
+            });
         }
     }
 }

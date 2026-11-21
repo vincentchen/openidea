@@ -20,9 +20,11 @@ pub(crate) const SERVER: &str = "jdtls";
 const GENERATED_SOURCES: &str = "openidea.java.generatedSources";
 
 pub(crate) mod configuration;
+pub(crate) mod exception_breakpoints;
 mod extract_interface;
 mod formatter;
 mod generated;
+pub(crate) use generated::is_processor_output;
 mod hierarchy;
 pub(crate) mod jvm_inspect;
 mod move_refactoring;
@@ -522,7 +524,10 @@ fn missing_bundle(e: &IdeError) -> bool {
 }
 
 /// Cancel local waits without interrupting a shared server's startup or import.
-async fn cancellable_wait<T>(cancel: &CancellationToken, wait: impl std::future::Future<Output = T>) -> IdeResult<T> {
+pub(crate) async fn cancellable_wait<T>(
+    cancel: &CancellationToken,
+    wait: impl std::future::Future<Output = T>,
+) -> IdeResult<T> {
     tokio::select! {
         biased;
         _ = cancel.cancelled() => Err(IdeError::cancelled()),

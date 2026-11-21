@@ -146,3 +146,105 @@ async fn replace_all_covers_matches_past_the_limit() {
         host.close_project("main");
     }
 }
+
+/// #4202: a file the search preview holds open (no unsaved changes) is saved like a closed
+/// one; a buffer with unsaved edits is replaced in place and left for the editor to save.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_all_saves_open_buffers_without_unsaved_changes() {
+    let temp = tempfile::tempdir().unwrap();
+    let base = dunce::canonicalize(temp.path()).unwrap();
+    let root = base.join("project");
+    std::fs::create_dir_all(&root).unwrap();
+    for name in ["previewed.txt", "edited.txt", "closed.txt"] {
+        std::fs::write(root.join(name), "TOKEN\n").unwrap();
+    }
+    let host = Host::new(HostConfig {
+        config_dir: base.join("config"),
+        data_dir: base.join("data"),
+        local_data_dir: base.join("data"),
+        languages: Arc::new(ide_language::LanguageRegistry::load(None).unwrap()),
+        syntax: Arc::default(),
+        sink_for: Box::new(|_| Arc::new(NullSink)),
+        owner: |w| w,
+        runtime: tokio::runtime::Handle::current(),
+        project_environment: false,
+    });
+    host.trust.decide(&root, true, false).unwrap();
+    host.open_project("main", &root).unwrap();
+    let project = host.project("main").unwrap();
+    project.documents.open(&root.join("previewed.txt")).unwrap();
+    let edited = project.documents.open(&root.join("edited.txt")).unwrap().id;
+    project.documents.replace_all(edited, "TOKEN\nmore\n").unwrap();
+    ops::search::replace_in_files(
+        &host,
+        "main",
+        RequestId::next(),
+        query("TOKEN", false),
+        "DONE".into(),
+        false,
+        vec![],
+        true,
+        ops::Channel::new(|_| {}),
+    )
+    .await
+    .unwrap();
+    let disk = |name: &str| std::fs::read_to_string(root.join(name)).unwrap();
+    assert_eq!(disk("previewed.txt"), "DONE\n");
+    assert_eq!(disk("closed.txt"), "DONE\n");
+    assert_eq!(disk("edited.txt"), "TOKEN\n", "unsaved edits stay unsaved");
+    assert_eq!(project.documents.text_snapshot(edited).unwrap().text, "DONE\nmore\n");
+    host.close_project("main");
+}
+
+/// Replace All past the limit replaces what the search lists: only the matches its Search
+/// Context keeps (comments, string literals or code), as below the limit.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn replace_all_past_the_limit_keeps_to_the_search_context() {
+    use ide_search::SearchContext as C;
+    let comments = |word: &str| lines(2001, &format!("// {word}"));
+    let code = |name: &str, string: &str| format!("fn {name}() -> &'static str {{ \"{string}\" }}\n");
+    let original = format!("{}{}", comments("tok"), code("tok", "tok"));
+    let cases = [
+        (C::Any, format!("{}{}", comments("X"), code("X", "X"))),
+        (C::InComments, format!("{}{}", comments("X"), code("tok", "tok"))),
+        (C::InStringLiterals, format!("{}{}", comments("tok"), code("tok", "X"))),
+        (C::ExceptComments, format!("{}{}", comments("tok"), code("X", "X"))),
+        (C::ExceptStringLiterals, format!("{}{}", comments("X"), code("X", "tok"))),
+        (C::ExceptCommentsAndStringLiterals, format!("{}{}", comments("tok"), code("X", "tok"))),
+    ];
+    for (context, expected) in cases {
+        let temp = tempfile::tempdir().unwrap();
+        let base = dunce::canonicalize(temp.path()).unwrap();
+        let root = base.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(root.join("lib.rs"), &original).unwrap();
+        let host = Host::new(HostConfig {
+            config_dir: base.join("config"),
+            data_dir: base.join("data"),
+            local_data_dir: base.join("data"),
+            languages: Arc::new(ide_language::LanguageRegistry::load(None).unwrap()),
+            syntax: Arc::default(),
+            sink_for: Box::new(|_| Arc::new(NullSink)),
+            owner: |w| w,
+            runtime: tokio::runtime::Handle::current(),
+            project_environment: false,
+        });
+        host.trust.decide(&root, true, false).unwrap();
+        host.open_project("main", &root).unwrap();
+        ops::search::replace_in_files(
+            &host,
+            "main",
+            RequestId::next(),
+            SearchQuery { context, ..query("tok", false) },
+            "X".into(),
+            false,
+            vec![],
+            true,
+            ops::Channel::new(|_| {}),
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(root.join("lib.rs")).unwrap(), expected, "{context:?}");
+        host.close_project("main");
+    }
+}

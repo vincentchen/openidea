@@ -1,5 +1,6 @@
 //! Protocol flow against an in-memory fake adapter.
 
+mod exception_classes;
 mod jvm_inspect;
 mod stream_trace;
 
@@ -505,13 +506,29 @@ async fn fake_adapter<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream
             "scopes" => {
                 ok!(msg, json!({"scopes": [{"name": "Locals", "variablesReference": 100, "expensive": false}]}))
             }
-            "variables" => ok!(
-                msg,
-                json!({"variables": [
-                    {"name": "x", "value": "1", "type": "int", "variablesReference": 0},
-                    {"name": "req", "value": "{Req}", "type": "Req", "variablesReference": 101, "evaluateName": "req"},
-                ]})
-            ),
+            // 200 holds a lazy value (java-debug's toString(), js-debug's getters): asked for, its
+            // reference answers one nameless child with the value and the reference of its fields.
+            "variables" => match msg["arguments"]["variablesReference"].as_i64() {
+                Some(200) => ok!(
+                    msg,
+                    json!({"variables": [
+                        {"name": "order", "value": "Order@7", "type": "Order", "variablesReference": 201,
+                         "evaluateName": "order", "presentationHint": {"lazy": true}},
+                        {"name": "n", "value": "2", "type": "int", "variablesReference": 0, "presentationHint": {"lazy": false}},
+                    ]})
+                ),
+                Some(201) => ok!(
+                    msg,
+                    json!({"variables": [{"name": "", "value": "Order@7 \"Order(1)\"", "variablesReference": 202, "evaluateName": "order"}]})
+                ),
+                _ => ok!(
+                    msg,
+                    json!({"variables": [
+                        {"name": "x", "value": "1", "type": "int", "variablesReference": 0},
+                        {"name": "req", "value": "{Req}", "type": "Req", "variablesReference": 101, "evaluateName": "req"},
+                    ]})
+                ),
+            },
             "evaluate" => ok!(msg, json!({"result": "42", "type": "int", "variablesReference": 0})),
             "completions" => ok!(
                 msg,
@@ -559,6 +576,10 @@ async fn fake_adapter<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream
                 }
             }
             "stepIn" | "stepOut" | "pause" => ok!(msg, Value::Null),
+            "hotReload" => {
+                ok!(msg, Value::Null);
+                send!(json!({"type": "event", "event": "flutter.appStarted", "body": {}}));
+            }
             "redefineClasses" => {
                 send!(
                     json!({"type": "event", "event": "hotcodereplace", "body": {"changeType": "STARTING", "message": "Start hot code replacement procedure..."}})
@@ -567,6 +588,20 @@ async fn fake_adapter<S: AsyncRead + AsyncWrite + Unpin + Send + 'static>(stream
                 send!(
                     json!({"type": "event", "event": "hotcodereplace", "body": {"changeType": 3, "message": "Build completed"}})
                 );
+            }
+            "hotRestart" => {
+                ok!(msg, Value::Null);
+                let uris = json!({"vmServiceUri": "ws://127.0.0.1:1/t=/ws"});
+                let navigate =
+                    |file: &str| json!({"kind": "navigate", "data": {"fileUri": file, "line": 3, "column": 5}});
+                // Not Flutter's yet: a plain Dart session sends these too.
+                send!(json!({"type": "event", "event": "dart.debuggerUris", "body": uris}));
+                send!(json!({"type": "event", "event": "dart.toolEvent", "body": navigate("file:///early.dart")}));
+                send!(json!({"type": "event", "event": "flutter.appStart", "body": {"deviceId": "d1"}}));
+                send!(json!({"type": "event", "event": "dart.debuggerUris", "body": uris}));
+                send!(json!({"type": "event", "event": "dart.toolEvent", "body": {"kind": "other", "data": {}}}));
+                send!(json!({"type": "event", "event": "dart.toolEvent", "body": navigate("package:a/a.dart")}));
+                send!(json!({"type": "event", "event": "dart.toolEvent", "body": navigate("file:///a%20b/main.dart")}));
             }
             "terminate" => {
                 ok!(msg, Value::Null);
@@ -1892,6 +1927,38 @@ async fn startup_sends_every_file_at_once_and_skips_files_with_nothing_enabled()
 }
 
 #[tokio::test]
+async fn hot_reload_sends_its_reason_and_reports_the_flutter_app() {
+    let h = harness(Script::default());
+    let id = h.start(config()).await.unwrap();
+    h.manager.hot_reload(id, HotReloadReason::Manual).await.unwrap();
+    h.manager.hot_reload(id, HotReloadReason::Save).await.unwrap();
+    let reasons: Vec<_> = requests(&h, "hotReload").iter().map(|args| args["reason"].clone()).collect();
+    assert_eq!(reasons, [json!("manual"), json!("save")]);
+    h.wait_event(|e| matches!(e, DebugEvent::FlutterAppStarted)).await;
+}
+
+#[tokio::test]
+async fn flutter_events_need_a_flutter_app() {
+    let h = harness(Script::default());
+    let id = h.start(config()).await.unwrap();
+    h.manager.hot_restart(id).await.unwrap();
+    let navigate = h.wait_event(|e| matches!(e, DebugEvent::FlutterNavigate { .. })).await;
+    let DebugEvent::FlutterNavigate { path, line, column } = navigate else { unreachable!() };
+    assert_eq!((path.as_ref(), line, column), (Path::new("/a b/main.dart"), 2, 4));
+    let events = h.events.lock();
+    let count = |want: fn(&DebugEvent) -> bool| {
+        events.iter().filter(|e| matches!(e, IdeEvent::Debug { event, .. } if want(event))).count()
+    };
+    assert_eq!(
+        count(
+            |e| matches!(e, DebugEvent::FlutterVmService { uri, device } if uri == "ws://127.0.0.1:1/t=/ws" && device.as_deref() == Some("d1"))
+        ),
+        1
+    );
+    assert_eq!(count(|e| matches!(e, DebugEvent::FlutterNavigate { .. })), 1);
+}
+
+#[tokio::test]
 async fn hot_swap_only_for_java_debug() {
     let h = harness(Script::default());
     let id = h.start(config()).await.unwrap();
@@ -1970,6 +2037,7 @@ fn godot_registry(port: u16, command: &str, args: &[&str]) -> Arc<LanguageRegist
             transport: "tcp".into(),
             connect: Some(format!("127.0.0.1:{port}")),
             install_hint: Some("Open the project in the Godot editor".into()),
+            resolve_lazy_variables: false,
             pinned: None,
         }),
     };
@@ -2278,6 +2346,16 @@ fn flutter_projects_are_found_from_the_program_or_the_working_directory() {
     assert!(!is_flutter_project(&tool, Some(&tool.join("bin/main.dart"))));
     assert!(!is_flutter_project(&root, None));
     std::fs::remove_dir_all(&root).unwrap();
+}
+
+#[test]
+fn the_flutter_device_follows_the_tool_arguments() {
+    let mut arguments = json!({ "toolArgs": ["--flavor", "dev"] });
+    add_flutter_device(&mut arguments, json!("macos"));
+    assert_eq!(arguments["toolArgs"], json!(["--flavor", "dev", "-d", "macos"]));
+    let mut arguments = json!({});
+    add_flutter_device(&mut arguments, json!("chrome"));
+    assert_eq!(arguments["toolArgs"], json!(["-d", "chrome"]));
 }
 
 #[test]
@@ -2703,6 +2781,53 @@ async fn step_of_one_thread_keeps_the_others_suspended() {
     assert_eq!(session.suspended.ticket(), ticket + 1);
     h.manager.step_in_target(id, 7, 1).await.unwrap();
     assert!(!session.suspended.get());
+    // The UI stays on a thread that is still stopped only when told the step ran one thread.
+    for thread in [7, 8] {
+        let continued =
+            h.wait_event(|e| matches!(e, DebugEvent::Continued { thread_id, .. } if *thread_id == thread)).await;
+        assert!(matches!(continued, DebugEvent::Continued { all_threads_continued: false, .. }), "{continued:?}");
+    }
+}
+
+#[tokio::test]
+async fn lazy_variables_are_resolved_when_the_adapter_declares_them_safe() {
+    let h = harness(Script::default());
+    let id = h.start(java_config("launch")).await.unwrap();
+    h.wait_event(|e| matches!(e, DebugEvent::Stopped { .. })).await;
+    let vars = h.manager.variables(id, 200).await.unwrap();
+    let order = &vars[0];
+    assert_eq!(
+        (order.name.as_str(), order.value.as_str(), order.type_name.as_deref()),
+        ("order", "Order@7 \"Order(1)\"", Some("Order"))
+    );
+    assert_eq!((order.variables_reference, order.lazy), (202, false));
+    assert_eq!(order.evaluate_name.as_deref(), Some("order"));
+    assert_eq!((vars[1].name.as_str(), vars[1].lazy), ("n", false));
+}
+
+#[tokio::test]
+async fn lazy_variables_stay_lazy_for_other_adapters() {
+    let h = harness(Script::default());
+    let id = h.start(config()).await.unwrap();
+    h.wait_event(|e| matches!(e, DebugEvent::Stopped { .. })).await;
+    let vars = h.manager.variables(id, 200).await.unwrap();
+    assert_eq!((vars[0].value.as_str(), vars[0].variables_reference, vars[0].lazy), ("Order@7", 201, true));
+    assert_eq!(requests(&h, "variables").len(), 1, "nothing is computed until asked for");
+
+    let order = h.manager.resolve_variable(id, vars[0].clone()).await.unwrap();
+    assert_eq!((order.name.as_str(), order.value.as_str()), ("order", "Order@7 \"Order(1)\""));
+    assert_eq!((order.variables_reference, order.lazy), (202, false));
+    let n = h.manager.resolve_variable(id, vars[1].clone()).await.unwrap();
+    assert_eq!((n.value.as_str(), requests(&h, "variables").len()), ("2", 2), "only lazy values are computed");
+}
+
+#[test]
+fn java_debug_declares_its_lazy_variables_safe_to_resolve() {
+    let languages = LanguageRegistry::load(None).unwrap();
+    for registry in [&languages, &LanguageRegistry::from_configs(Vec::new())] {
+        assert!(adapter::find_config(registry, "java-debug").unwrap().resolve_lazy_variables);
+        assert!(!adapter::find_config(registry, "js-debug").unwrap().resolve_lazy_variables);
+    }
 }
 
 #[tokio::test]

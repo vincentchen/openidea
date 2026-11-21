@@ -1,13 +1,12 @@
 //! Parallel walk + per-file search.
 
 use crate::iter::for_each_match;
-use crate::line::line_match;
+use crate::line::line_matches;
 use crate::mask::FileMask;
 use crate::pattern::ScopePattern;
 use crate::query::{Compiled, line_terminator};
 use crate::{
-    FileMatches, LineMatch, LiteralKind, LiteralRange, Literals, PathFilter, SearchContext, SearchScope, SearchSummary,
-    TextSource,
+    FileMatches, LineMatch, LiteralRange, Literals, PathFilter, SearchContext, SearchScope, SearchSummary, TextSource,
 };
 use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
@@ -36,6 +35,8 @@ pub(crate) struct Request<'a> {
     pub context: SearchContext,
     pub literals: Option<Literals<'a>>,
     pub max_matches: u32,
+    /// Skip what `.gitignore` / `.ignore` / `info/exclude` leave out.
+    pub ignore_rules: bool,
     pub text: TextSource<'a>,
     pub cancel: &'a CancellationToken,
     pub on_file: &'a (dyn Fn(FileMatches) + Sync),
@@ -50,6 +51,7 @@ struct Control<'a> {
     matches: AtomicU32,
     files: AtomicU32,
     max: u32,
+    whole_word: bool,
 }
 
 impl Control<'_> {
@@ -129,6 +131,7 @@ pub(crate) fn run(req: Request<'_>) -> IdeResult<SearchSummary> {
             matches: AtomicU32::new(0),
             files: AtomicU32::new(0),
             max: if req.max_matches == 0 { DEFAULT_MAX_MATCHES } else { req.max_matches },
+            whole_word: req.compiled.whole_word,
         },
     };
     let mut searcher_builder = SearcherBuilder::new();
@@ -153,6 +156,7 @@ pub(crate) fn run(req: Request<'_>) -> IdeResult<SearchSummary> {
     if !ctx.ctl.should_stop() {
         walk_files(
             &on_disk,
+            req.ignore_rules,
             &|path| ctx.mask.has_directory_exclusions() && ctx.mask.excludes_dir(&rel_path(ctx.root, path)),
             || {
                 let mut searcher = searcher_builder.build();
@@ -187,9 +191,11 @@ pub(crate) type VisitFile<'s> = Box<dyn FnMut(&Path) -> WalkState + Send + 's>;
 /// `.gitignore` / `.ignore` / `info/exclude` are skipped with everything in
 /// them, while ignored files elsewhere (`.env`) and hidden files and folders
 /// (`.github`, `.eslintrc`) are visited. `.git`, symlinks and archives (jar,
-/// zip: browsed, not searched) are never visited.
+/// zip: browsed, not searched) are never visited. Without `ignore_rules` the
+/// ignored directories are visited too.
 pub(crate) fn walk_files<'s>(
     roots: &[PathBuf],
+    ignore_rules: bool,
     skip_dir: &'s (dyn Fn(&Path) -> bool + Sync),
     mut visitor: impl FnMut() -> VisitFile<'s> + Send,
 ) {
@@ -199,11 +205,11 @@ pub(crate) fn walk_files<'s>(
         walk.add(path);
     }
     walk.hidden(false)
-        .ignore(true)
-        .git_ignore(true)
-        .git_global(true)
-        .git_exclude(true)
-        .parents(true)
+        .ignore(ignore_rules)
+        .git_ignore(ignore_rules)
+        .git_global(ignore_rules)
+        .git_exclude(ignore_rules)
+        .parents(ignore_rules)
         .require_git(ide_core::ignored::inside_git_repo(first))
         .follow_links(false)
         .threads(std::thread::available_parallelism().map_or(4, |n| n.get()).min(12))
@@ -457,12 +463,6 @@ impl<'a> FileSink<'a> {
     }
 }
 
-/// Kind of the comment or string literal containing byte `pos` (`literals` sorted).
-fn literal_at(literals: &[LiteralRange], pos: usize) -> Option<LiteralKind> {
-    let i = literals.partition_point(|l| l.start <= pos);
-    literals[..i].last().filter(|l| pos < l.end).map(|l| l.kind)
-}
-
 impl Sink for FileSink<'_> {
     type Error = io::Error;
 
@@ -483,12 +483,12 @@ impl Sink for FileSink<'_> {
         let mut found = std::mem::take(&mut self.found);
         let mut ranges = std::mem::take(&mut self.ranges);
         found.clear();
-        for_each_match(self.matcher, &buffer[..range.end], range.start, |mm| {
+        for_each_match(self.matcher, self.ctl.whole_word, &buffer[..range.end], range.start, |mm| {
             found.push((mm.start() - range.start, mm.end() - range.start));
         });
         if let Some((context, literals)) = self.context {
             let block_start = usize::try_from(m.absolute_byte_offset()).unwrap_or(usize::MAX);
-            found.retain(|&(a, _)| context.accepts(literal_at(literals, block_start.saturating_add(a))));
+            found.retain(|&(a, _)| context.keeps(literals, block_start.saturating_add(a)));
         }
 
         let mut next = found.iter().copied().peekable();
@@ -516,7 +516,7 @@ impl Sink for FileSink<'_> {
             if !ranges.is_empty() {
                 self.count = self.count.saturating_add(u32::try_from(ranges.len()).unwrap_or(u32::MAX));
                 let line_no = u32::try_from(line_no).unwrap_or(u32::MAX);
-                self.lines.push(line_match(line_no, &block[line_start..content_end], &ranges));
+                line_matches(line_no, &block[line_start..content_end], &ranges, &mut self.lines);
             }
             line_start = line_end_incl;
             line_no += 1;
@@ -662,7 +662,7 @@ mod walk_tests {
         std::fs::write(root.join("edge/device/src/main.go"), "hit").unwrap();
         let mask = FileMask::new(&[], &["**/build/**".into()]).unwrap();
         let seen = Mutex::new(Vec::new());
-        walk_files(&[root.to_path_buf()], &|path| mask.excludes_dir(&rel_path(root, path)), || {
+        walk_files(&[root.to_path_buf()], true, &|path| mask.excludes_dir(&rel_path(root, path)), || {
             let seen = &seen;
             Box::new(move |path| {
                 // No file-level mask here: a visit means the walker entered the subtree.
@@ -672,13 +672,18 @@ mod walk_tests {
         });
         assert_eq!(*seen.lock().unwrap(), ["edge/device/src/main.go"]);
         seen.lock().unwrap().clear();
-        walk_files(&[root.join("edge/device/build/deep")], &|path| mask.excludes_dir(&rel_path(root, path)), || {
-            let seen = &seen;
-            Box::new(move |path| {
-                seen.lock().unwrap().push(rel_path(root, path));
-                WalkState::Continue
-            })
-        });
+        walk_files(
+            &[root.join("edge/device/build/deep")],
+            true,
+            &|path| mask.excludes_dir(&rel_path(root, path)),
+            || {
+                let seen = &seen;
+                Box::new(move |path| {
+                    seen.lock().unwrap().push(rel_path(root, path));
+                    WalkState::Continue
+                })
+            },
+        );
         assert!(seen.lock().unwrap().is_empty());
     }
 }
@@ -696,6 +701,7 @@ mod budget_tests {
             matches: AtomicU32::new(0),
             files: AtomicU32::new(0),
             max,
+            whole_word: false,
         }
     }
 
