@@ -1,12 +1,15 @@
 name: Kylin sync
 
-# Keeps the `kylin` branch on the newest upstream release tag and asks
-# `Kylin build` to package and publish it.
+# Keeps the `kylin` branch on the newest upstream release tag and lets
+# `Kylin build` package and publish it.
 #
-# A tag pushed with GITHUB_TOKEN does not start the tag-triggered workflow:
-# GitHub suppresses events caused by GITHUB_TOKEN. `workflow_dispatch` is the
-# documented exception, so the last step dispatches the build explicitly
-# instead of relying on the tag push.
+# The push uses a personal access token (`KYLIN_SYNC_TOKEN`, contents +
+# workflows write) rather than GITHUB_TOKEN, for two reasons:
+#   * GITHUB_TOKEN may not create or update files under .github/workflows/,
+#     and an upstream merge routinely does;
+#   * events caused by GITHUB_TOKEN do not start other workflows, so the
+#     kylin-v* tag push would not trigger the build.
+# A token push does trigger it, so no separate dispatch is needed.
 #
 # Scheduled workflows run from the default branch, which is why this file also
 # lives on `main`; it checks out `kylin` itself.
@@ -25,8 +28,7 @@ on:
         type: string
 
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 concurrency:
   group: kylin-sync
@@ -40,10 +42,21 @@ jobs:
     name: Sync upstream tag
     runs-on: ubuntu-latest
     steps:
+      - name: Check the token
+        env:
+          SYNC_TOKEN: ${{ secrets.KYLIN_SYNC_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "$SYNC_TOKEN" ]; then
+            echo "::error::KYLIN_SYNC_TOKEN is not set: add a fine-grained token with contents and workflows write"
+            exit 1
+          fi
+
       - uses: actions/checkout@v5
         with:
           ref: kylin
           fetch-depth: 0
+          token: ${{ secrets.KYLIN_SYNC_TOKEN }}
 
       - name: Pick the newest stable tag
         id: pick
@@ -88,6 +101,8 @@ jobs:
             echo "new=true" >> "$GITHUB_OUTPUT"
           fi
 
+      # The tag push is what starts `Kylin build`; the branch push only keeps
+      # `kylin` current, so it carries no build trigger of its own.
       - name: Push the branch and the tag
         if: steps.version.outputs.new == 'true'
         run: |
@@ -96,13 +111,4 @@ jobs:
           git push origin kylin
           git tag "kylin-v$version"
           git push origin "kylin-v$version"
-
-      - name: Build and publish
-        if: steps.version.outputs.new == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          set -euo pipefail
-          version='${{ steps.version.outputs.version }}'
-          gh workflow run kylin.yml --ref "kylin-v$version" -f release=true
-          echo "dispatched kylin.yml for kylin-v$version"
+          echo "pushed kylin-v$version"
