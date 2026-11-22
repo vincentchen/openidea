@@ -201,6 +201,10 @@ echo "copying tools to $dest (about 1.5 GB)…"
 cp -a "$dir/data/." "$dest/data/"
 rm -rf "$dest/runtime"
 cp -a "$dir/runtime" "$dest/runtime"
+# The server binary, for people who want to run the server themselves
+# (`$dest/bin/openidea-server`); the desktop keeps downloading its own copy.
+mkdir -p "$dest/bin"
+cp -a "$dir/bin/openidea-server" "$dest/bin/"
 mkdir -p "$dest/scripts"
 cp "$dir/scripts/repair-tools-paths.sh" "$dest/scripts/"
 chmod +x "$dest/scripts/repair-tools-paths.sh"
