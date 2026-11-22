@@ -88,27 +88,39 @@ jobs:
             git merge --no-edit "$tag"
           fi
 
-      - name: Check whether this version is already published
+      # Two packages come from one merge: the desktop app and the offline
+      # language pack. Each tag is checked on its own, so a run that only
+      # failed to publish one of them can add it later.
+      - name: Check which packages are already published
         id: version
         run: |
           set -euo pipefail
           version=$(jq -r .version src-tauri/tauri.conf.json)
           echo "version=$version" >> "$GITHUB_OUTPUT"
-          if git ls-remote --exit-code --tags origin "refs/tags/kylin-v$version" >/dev/null 2>&1; then
-            echo "kylin-v$version already exists, nothing to do"
-            echo "new=false" >> "$GITHUB_OUTPUT"
-          else
-            echo "new=true" >> "$GITHUB_OUTPUT"
-          fi
+          new=true
+          if git ls-remote --exit-code --tags origin "refs/tags/kylin-v$version" >/dev/null 2>&1; then new=false; fi
+          server_new=true
+          if git ls-remote --exit-code --tags origin "refs/tags/kylin-server-v$version" >/dev/null 2>&1; then server_new=false; fi
+          echo "new=$new" >> "$GITHUB_OUTPUT"
+          echo "server_new=$server_new" >> "$GITHUB_OUTPUT"
+          echo "desktop app: $new, language server pack: $server_new"
 
-      # The tag push is what starts `Kylin build`; the branch push only keeps
-      # `kylin` current, so it carries no build trigger of its own.
-      - name: Push the branch and the tag
-        if: steps.version.outputs.new == 'true'
+      # The tag pushes are what start `Kylin build` and `Kylin language server
+      # pack`; the branch push only keeps `kylin` current, so it carries no
+      # build trigger of its own.
+      - name: Push the branch and the tags
+        if: steps.version.outputs.new == 'true' || steps.version.outputs.server_new == 'true'
         run: |
           set -euo pipefail
           version='${{ steps.version.outputs.version }}'
           git push origin kylin
-          git tag "kylin-v$version"
-          git push origin "kylin-v$version"
-          echo "pushed kylin-v$version"
+          if [ '${{ steps.version.outputs.new }}' = true ]; then
+            git tag "kylin-v$version"
+            git push origin "kylin-v$version"
+            echo "pushed kylin-v$version"
+          fi
+          if [ '${{ steps.version.outputs.server_new }}' = true ]; then
+            git tag "kylin-server-v$version"
+            git push origin "kylin-server-v$version"
+            echo "pushed kylin-server-v$version"
+          fi

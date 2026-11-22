@@ -35,9 +35,13 @@ fn main() {
         };
         std::process::exit(code);
     }
+    if args.iter().any(|a| a == "--install-tools") {
+        std::process::exit(install_tools());
+    }
     if !args.iter().any(|a| a == "--stdio") {
         eprintln!(
-            "usage: openidea-server --stdio | --mcp-stdio [--project <path>] | --connect <host> <port> | --version"
+            "usage: openidea-server --stdio | --mcp-stdio [--project <path>] | --connect <host> <port> | --version \
+             | --install-tools"
         );
         std::process::exit(2);
     }
@@ -62,6 +66,138 @@ fn main() {
 fn server_home() -> PathBuf {
     let home = dirs::home_dir().unwrap_or_default();
     std::env::var_os("OPENIDEA_SERVER_HOME").map(PathBuf::from).unwrap_or_else(|| home.join(".openidea"))
+}
+
+/// `--install-tools`: installs every managed tool (language servers, debuggers,
+/// plugins) and the JDK into `<OPENIDEA_SERVER_HOME>/data`, so the result can be
+/// shipped as an offline pack (see `scripts/kylin/bundle-tools.sh`).
+///
+/// `OPENIDEA_INSTALL_TOOLS_ONLY` / `OPENIDEA_INSTALL_TOOLS_SKIP` narrow the set
+/// (comma-separated registry names). One `status<TAB>name<TAB>detail` line per
+/// tool goes to stdout and to `data/install-report.tsv`; the exit code is 1 when
+/// a tool that should have installed failed.
+fn install_tools() -> i32 {
+    use ide_tools::{InstallEvent, ToolKind, Tools};
+
+    let base = server_home();
+    let (config_dir, data_dir) = (base.join("config"), base.join("data"));
+    for dir in [&config_dir, &data_dir] {
+        if let Err(e) = std::fs::create_dir_all(dir) {
+            eprintln!("cannot create {}: {e}", dir.display());
+            return 1;
+        }
+    }
+    let languages = match LanguageRegistry::load(Some(&config_dir.join("languages"))) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("language definitions: {e}");
+            return 1;
+        }
+    };
+    let langs = languages.all();
+    let cancel = ide_core::CancellationToken::new();
+    let list = |name: &str| -> Vec<String> {
+        std::env::var(name).map(|v| v.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect()).unwrap_or_default()
+    };
+    let (only, skip) = (list("OPENIDEA_INSTALL_TOOLS_ONLY"), list("OPENIDEA_INSTALL_TOOLS_SKIP"));
+    // Progress is noisy for ~60 downloads: one line per tenth.
+    let step = std::sync::atomic::AtomicU64::new(11);
+    let emit = |e: InstallEvent| match e {
+        InstallEvent::Line { text } => eprintln!("  {text}"),
+        InstallEvent::Progress { fraction, message } => {
+            let Some(f) = fraction else { return };
+            let bucket = (f.clamp(0.0, 1.0) * 10.0) as u64;
+            if step.swap(bucket, std::sync::atomic::Ordering::Relaxed) != bucket {
+                eprintln!("  {message} ({}%)", bucket * 10);
+            }
+        }
+    };
+    let mut report = String::new();
+    let mut note = |status: &str, name: &str, detail: &str| {
+        let line = format!("{status}\t{name}\t{detail}");
+        println!("{line}");
+        report.push_str(&line);
+        report.push('\n');
+    };
+
+    // Java first: jdtls, java-debug and the Java language support need a JDK while installing.
+    let jdks = ide_tools::jdk::jdks_dir(&data_dir);
+    let jdk = Tools::new(&data_dir).download_jdk(ide_tools::jdk::TEMURIN, 21, Some(&jdks), &cancel, &emit);
+    match jdk {
+        Ok(jdk) => {
+            let home: &std::path::Path = jdk.home.as_ref();
+            note("ok", "jdk-21", &jdk.version);
+            // `which("java")` of the tools below must see it.
+            let path = std::env::var_os("PATH").unwrap_or_default();
+            let mut dirs = vec![home.join("bin")];
+            dirs.extend(std::env::split_paths(&path));
+            if let Ok(joined) = std::env::join_paths(dirs) {
+                // SAFETY: `--install-tools` is single-threaded up to this point.
+                unsafe { std::env::set_var("PATH", joined) };
+            }
+        }
+        Err(e) => {
+            note("failed", "jdk-21", &e.to_string());
+        }
+    }
+    let tools = Tools::new(&data_dir);
+    let mut failed = 0;
+    for spec in ide_tools::TOOLS {
+        let name = spec.name;
+        if matches!(spec.kind, ToolKind::Cli) {
+            continue;
+        }
+        if !only.is_empty() && !only.iter().any(|n| n == name) {
+            continue;
+        }
+        if skip.iter().any(|n| n == name) {
+            note("skipped", name, "OPENIDEA_INSTALL_TOOLS_SKIP");
+            continue;
+        }
+        // Neither is portable: rustup's component lives in the toolchain, and an
+        // "active" gem installs into the project, not the tools directory.
+        match spec.method {
+            ide_tools::Method::Rustup { .. } => {
+                note("skipped", name, "needs rustup on the target host");
+                continue;
+            }
+            ide_tools::Method::GemActive { .. } => {
+                note("skipped", name, "installs into the project (needs Ruby on the target)");
+                continue;
+            }
+            _ => {}
+        }
+        let info = match tools.info(name, &langs) {
+            Ok(i) => i,
+            Err(e) => {
+                note("failed", name, &e.to_string());
+                failed += 1;
+                continue;
+            }
+        };
+        if info.status == ide_tools::ToolStatus::Installed {
+            note("present", name, info.version.as_deref().unwrap_or(""));
+            continue;
+        }
+        if !info.can_install {
+            note("unavailable", name, info.unavailable_reason.as_deref().unwrap_or(""));
+            continue;
+        }
+        eprintln!("==> {name} ({})", info.display_name);
+        match tools.install(name, &langs, &cancel, &emit) {
+            Ok(done) => note("ok", name, done.version.as_deref().unwrap_or("")),
+            Err(e) => {
+                note("failed", name, &e.to_string());
+                failed += 1;
+            }
+        }
+    }
+    let report_path = data_dir.join("install-report.tsv");
+    if let Err(e) = std::fs::write(&report_path, &report) {
+        eprintln!("cannot write {}: {e}", report_path.display());
+    }
+    eprintln!("report: {}", report_path.display());
+    if failed > 0 { 1 } else { 0 }
 }
 
 async fn run(base: PathBuf) -> i32 {

@@ -1,0 +1,270 @@
+name: Kylin language server pack
+
+# Packages `openidea-server`, the remote development backend, as an offline
+# language pack for Kylin / domestic Linux (x86_64 and arm64).
+#
+# The pack carries the static (musl) server, every language server, debugger
+# and plugin the desktop otherwise downloads on demand, a JDK, and the Node and
+# Python runtimes those tools need. It runs on a host with no network and no
+# Node/Python/Java installed.
+#
+# Triggers:
+#   - manual run (Actions -> Kylin language server pack -> Run workflow)
+#   - push of a `kylin-server-v*` tag (also publishes a release); `Kylin sync`
+#     creates those tags next to `kylin-v*`, so a new upstream release gets
+#     both packages.
+#
+# A plain push to `kylin` does not build.
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build (branch, tag or SHA). Empty = the selected branch."
+        required: false
+        type: string
+      release:
+        description: "Publish the packs as a GitHub release"
+        required: false
+        type: boolean
+        default: true
+  push:
+    tags: ["kylin-server-v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: kylin-server-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+  RUST_BACKTRACE: 1
+  # Pinned so a rebuild of a tag produces the same runtimes.
+  NODE_VERSION: 22.23.5
+  PYTHON_VERSION: 3.12.16
+  PBS_RELEASE: "20261110"
+
+jobs:
+  version:
+    name: Read version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.read.outputs.version }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+      - id: read
+        run: echo "version=$(jq -r .version src-tauri/tauri.conf.json)" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Pack ${{ matrix.arch }}
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-22.04
+            target: x86_64-unknown-linux-musl
+          - arch: arm64
+            runner: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-musl
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: ${{ inputs.ref || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: kylin-server-${{ matrix.target }}
+
+      # The pack (about 1.5 GB), its archive and the copy the verify step makes
+      # need room next to the Rust build.
+      - name: Free disk space
+        run: |
+          sudo rm -rf /usr/local/lib/android /usr/local/.ghcup /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/share/swift /usr/local/share/chromium || true
+          df -h /
+
+      # The language servers come from Go, npm, PyPI, RubyGems and .NET; the
+      # Node and Python that run them are the bundled ones, so they are not set
+      # up here. `pigz` keeps the archive step short.
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools pigz jq
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.24"
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: 8.0.x
+
+      - name: Build the static server
+        run: |
+          # musl-tools only ships `musl-gcc`; cc-rs would look for
+          # `<arch>-linux-musl-gcc`.
+          export "CC_${TARGET//-/_}=musl-gcc"
+          cargo build --release --locked -p ide-host --bin openidea-server --target "$TARGET"
+        env:
+          TARGET: ${{ matrix.target }}
+
+      - name: Bundle the offline language pack
+        run: |
+          rm -rf kylin-server-dist
+          mkdir -p kylin-server-dist
+          bash scripts/kylin/bundle-tools.sh \
+            '${{ matrix.arch }}' \
+            "target/${{ matrix.target }}/release/openidea-server" \
+            kylin-server-dist
+          cp "kylin-server-dist/OpenIDEA-server-${{ needs.version.outputs.version }}-kylin-${{ matrix.arch }}/data/install-report.tsv" \
+             "kylin-server-dist/install-report-${{ matrix.arch }}.tsv"
+          ls -lh kylin-server-dist
+
+      # Unpacks the archive somewhere else, repairs the recorded paths, installs
+      # it like a user would, and runs the tools from the installed location:
+      # the two things that break a relocated Python virtualenv.
+      - name: Verify the pack
+        run: |
+          set -euo pipefail
+          version='${{ needs.version.outputs.version }}'
+          arch='${{ matrix.arch }}'
+          work=$(mktemp -d)
+          tar -xzf "kylin-server-dist/OpenIDEA-server_${version}_kylin_${arch}.tar.gz" -C "$work"
+          pack="$work/OpenIDEA-server-${version}-kylin-${arch}"
+          home="$work/home"
+
+          echo "== portable launcher =="
+          test -x "$pack/openidea-server"
+          "$pack/openidea-server" --version
+
+          # What the tree was built at; `repair-tools-paths.sh` rewrites it after
+          # the move, so read it before `install.sh` repairs the copy.
+          build_root=$(head -1 "kylin-server-dist/OpenIDEA-server-${version}-kylin-${arch}/data/.openidea-pack-root")
+
+          echo "== install.sh =="
+          "$pack/install.sh" --prefix "$home" --no-profile
+
+          echo "== relocated paths =="
+          if grep -rlIF "$build_root" "$home/data/tools"/*/venv "$home/data/tools"/*/bin 2>/dev/null | grep -q .; then
+            echo "::error::the installed tools still point at $build_root"
+            exit 1
+          fi
+          echo "no build paths left"
+
+          echo "== runtimes =="
+          "$home/runtime/node/bin/node" --version
+          "$home/runtime/python/bin/python3" --version
+          java=$(find "$home/data/tools/jdks" -type f -path '*/bin/java' -print -quit)
+          test -n "$java"
+          "$java" -version
+
+          echo "== language servers =="
+          export PATH="$home/runtime/node/bin:$home/runtime/python/bin:$home/data/tools/node_modules/.bin:$PATH"
+          "$home/data/tools/node_modules/.bin/vtsls" --version
+          "$home/data/tools/node_modules/.bin/typescript-language-server" --version
+          "$home/data/tools/ruff/venv/bin/ruff" --version
+          "$home/data/tools/basedpyright/venv/bin/basedpyright" --version
+          "$home/data/tools/gopls/bin/gopls" version
+          # clangd has no Linux aarch64 release.
+          if [ -x "$home/data/tools/clangd/bin/clangd" ]; then
+            "$home/data/tools/clangd/bin/clangd" --version | head -1
+          fi
+          "$home/data/tools/taplo/bin/taplo" --version
+          "$home/data/tools/lua-language-server/bin/lua-language-server" --version 2>&1 | head -1 || true
+          test -x "$home/data/tools/jdtls/bin/jdtls"
+          ls "$home/data/tools/jdtls/plugins/org.eclipse.equinox.launcher_"*.jar > /dev/null
+          test -x "$home/data/tools/kotlin-lsp/bin/kotlin-lsp"
+          ls "$home/data/tools/java-debug/bin/"*.jar > /dev/null
+          "$home/runtime/python/bin/python3" -c \
+            "import sys; sys.path.insert(0, '$home/data/tools/debugpy/lib'); import debugpy; print('debugpy', debugpy.__version__)"
+
+          echo "== server =="
+          OPENIDEA_SERVER_HOME="$home" "$home/bin/openidea-server" --version
+          # EOF on stdin: the RPC loop ends and the server shuts down.
+          set +e
+          printf '' | OPENIDEA_SERVER_HOME="$home" timeout 120 "$home/bin/openidea-server" --stdio > /tmp/stdio.log 2>&1
+          rc=$?
+          set -e
+          sed -n '1,20p' /tmp/stdio.log
+          [ "$rc" = 0 ] || { echo "::error::--stdio exited $rc"; exit 1; }
+
+          echo "== size =="
+          du -sh "$pack" "$home"
+          grep -cE $'^(ok|present)\t' "$home/data/install-report.tsv" | sed 's/^/  installed tools: /'
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: openidea-kylin-server-${{ matrix.arch }}
+          path: kylin-server-dist/*
+          if-no-files-found: error
+          retention-days: 30
+
+  release:
+    name: Publish release
+    if: ${{ (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/kylin-server-v')) || inputs.release }}
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: (cd dist && sha256sum -- *.tar.gz openidea-server-linux-*.gz > SHA256SUMS && cat SHA256SUMS)
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || format('kylin-server-v{0}', needs.version.outputs.version) }}
+          name: OpenIDEA server ${{ needs.version.outputs.version }} for Kylin (offline language pack)
+          body: |
+            `openidea-server` ${{ needs.version.outputs.version }} for Kylin / domestic
+            Linux, with its language tooling offline: the remote development backend,
+            every language server, debugger and plugin the desktop otherwise downloads
+            on demand, a JDK, and the Node and Python runtimes those tools need.
+
+            | Architecture | Pack | Server |
+            | --- | --- | --- |
+            | x86_64 (`amd64`) | `OpenIDEA-server_${{ needs.version.outputs.version }}_kylin_amd64.tar.gz` | `openidea-server-linux-x86_64.gz` |
+            | aarch64 (`arm64`) | `OpenIDEA-server_${{ needs.version.outputs.version }}_kylin_arm64.tar.gz` | `openidea-server-linux-aarch64.gz` |
+
+            **Portable.** Unpack and run; no installation, no network, no system Node,
+            Python or Java:
+
+            ```
+            tar -xzf OpenIDEA-server_${{ needs.version.outputs.version }}_kylin_amd64.tar.gz
+            cd OpenIDEA-server-${{ needs.version.outputs.version }}-kylin-amd64
+            ./openidea-server --version
+            ```
+
+            **For the desktop's remote development.** `./install.sh` copies the tools
+            into `~/.openidea` (where the desktop looks for the remote host's tools)
+            and adds the bundled Node and Python to `PATH` in the shell profile.
+            Re-login, then connect over SSH as usual.
+
+            **Contents.** Static musl `openidea-server` (runs on glibc 2.28+), Eclipse
+            Temurin 21, Node.js, CPython, and every managed tool with its version in
+            `data/install-report.tsv`. `rust-analyzer` needs rustup on the host;
+            `solargraph` needs Ruby; `csharp-ls` and `fsautocomplete` need the .NET
+            runtime — those runtimes are not bundled.
+
+            Refresh or add tools later with `./openidea-server --install-tools`
+            (needs network), or pick names with
+            `OPENIDEA_INSTALL_TOOLS_ONLY=jdtls,gopls`.
+
+            `SHA256SUMS` covers every asset.
+          files: dist/*
+          fail_on_unmatched_files: true

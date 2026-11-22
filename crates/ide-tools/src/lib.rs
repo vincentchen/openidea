@@ -1244,7 +1244,11 @@ impl Tools {
             if let Some(uv) = self.which("uv") {
                 let mut c = self.command(&uv);
                 c.arg("venv").arg(&venv);
-                if let Some(python) = self.runtime_commands.get("python") {
+                // With no project SDK, the interpreter found on PATH — for the
+                // offline pack, the bundled runtime. `uv venv` otherwise prefers
+                // its own managed Python over the PATH one.
+                let interpreter = self.runtime_commands.get("python").cloned().or_else(|| self.python());
+                if let Some(python) = interpreter {
                     c.arg("--python").arg(python);
                 }
                 run_streamed(c, cancel, emit)?;
